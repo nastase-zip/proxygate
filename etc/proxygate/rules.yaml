@@ -1,0 +1,34 @@
+# ProxyGate routing rules
+# Rules are evaluated top-to-bottom; first match wins.
+# Patterns support glob syntax: *.example.com, example.com, 10.0.*
+# proxy: must match a name in the proxies list, or be "DIRECT"
+
+proxies:
+  - name: ExpressVPN
+    type: http
+    host: 127.0.0.1
+    port: 8893
+
+  - name: MySOCKS
+    type: socks5
+    host: 1.2.3.4
+    port: 1080
+
+rules:
+  - name: Google Services
+    pattern: "*.google.com"
+    proxy: ExpressVPN
+    enabled: true
+
+  - name: Cloudflare Direct
+    pattern: "*.cloudflare.com"
+    proxy: DIRECT
+    enabled: true
+
+  - name: Custom SOCKS route
+    pattern: "*.example-internal.net"
+    proxy: MySOCKS
+    enabled: false
+
+# Traffic not matched by any rule uses this proxy
+default: ExpressVPN

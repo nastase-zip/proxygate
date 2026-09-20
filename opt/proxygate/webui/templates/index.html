@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ProxyGate</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">
+</head>
+<body>
+
+<div id="app">
+
+  <header id="topbar">
+    <span id="topbar-left">
+      <button id="darkmode-toggle" title="Toggle dark mode"><i class="fa-solid fa-sun"></i></button>
+      <span id="app-title">ProxyGate</span>
+    </span>
+
+    <div id="rules-status" class="topbar-status hidden"></div>
+    <span id="topbar-gateway">
+      <span id="conn-indicator" class="conn-indicator conn-unknown">
+        <span class="dot" id="debug-dot"></span>
+        <span id="conn-indicator-text">connecting…</span>
+      </span>
+      <div id="sp-status-line" class="status-line"></div>
+      <div id="interface-conflict-banner" class="conflict-banner hidden"></div>
+    </span>
+
+    <span id="topbar-right">
+      <button id="gw-toggle-btn" class="gw-idle">Connect</button>
+      <button id="restart-mitm-btn" class="topbar-btn"><i class="fa-solid fa-rotate"></i> Restart mitmproxy</button>
+      <div id="status-dropdown-wrap">
+        <button id="status-dropdown-btn" class="icon-btn" title="System status"><i class="fa-solid fa-circle-info"></i></button>
+        <div id="status-dropdown" class="hidden">
+          <div class="status-drop-section">
+            <div class="status-drop-label">Services</div>
+            <div id="services-list"></div>
+          </div>
+          <div class="status-drop-section">
+            <div class="status-drop-label">Network</div>
+            <div class="stat-grid">
+              <div class="stat-row"><span class="stat-key">AP interface</span><span class="stat-val" id="ap-interface">—</span></div>
+              <div class="stat-row"><span class="stat-key">WAN interface</span><span class="stat-val" id="wan-interface">—</span></div>
+              <div class="stat-row"><span class="stat-key">Hotspot IP</span><span class="stat-val" id="hotspot-ip">—</span></div>
+              <div class="stat-row"><span class="stat-key">Devices</span><span class="stat-val" id="hotspot-devices">0</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <button id="settings-btn" class="icon-btn" title="Settings"><i class="fa-solid fa-gear"></i></button>
+    </span>
+  </header>
+
+  <main id="panels">
+
+    <!-- ── Left: Rules / Proxies tabbed ───────────────────────────── -->
+    <section id="panel-left" class="panel">
+
+      <div class="left-tabs">
+        <div class="left-tab active" id="tab-rules">Rules</div>
+        <div class="left-tab" id="tab-proxies">Proxies</div>
+        <div class="left-tab" id="tab-devices">Devices</div>
+        <button id="rule-add-btn" class="tab-add-btn hidden" title="Add rule (Shift++)"><i class="fa-solid fa-plus"></i></button>
+        <button id="proxy-add-btn" class="tab-add-btn hidden" title="Add proxy (Shift++)"><i class="fa-solid fa-plus"></i></button>
+        <button id="device-add-btn" class="tab-add-btn hidden" title="Add device to decrypt"><i class="fa-solid fa-plus"></i></button>
+      </div>
+
+      <div id="panel-rules-inner">
+        <div id="rules-list" class="scroll-list"></div>
+        <div id="rules-footer">
+          <span class="dim-label">↳ Unmatched traffic</span>
+          <select id="fallback-select"></select>
+          <button id="apply-rules-btn" class="primary full-width">Force Apply</button>
+        </div>
+      </div>
+
+      <div id="panel-proxies-inner">
+        <div id="proxy-list" class="scroll-list"></div>
+      </div>
+
+      <div id="panel-devices-inner">
+        <div class="dim-label" id="devices-help">
+          Devices flagged below get real HTTPS decryption (needs the ProxyGate
+          CA installed &amp; trusted on that device). Everything else stays
+          passthrough — no CA needed.
+        </div>
+        <div id="device-list" class="scroll-list"></div>
+        <div id="devices-footer">
+          <a id="ca-cert-link" href="/api/devices/ca-cert" class="full-width" download>
+            <button type="button" class="full-width">↓ Download CA certificate</button>
+          </a>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ── Center: Traffic ─────────────────────────────────────────── -->
+    <section id="panel-traffic" class="panel">
+      <div class="traffic-toolbar">
+        <input id="traffic-filter" type="text" placeholder="Filter by host or IP…">
+        <button id="traffic-focus-btn">Focus</button>
+        <div class="toolbar-icon-group">
+          <button id="traffic-export-btn" class="icon-btn" title="Export as CSV"><i class="fa-solid fa-file-csv"></i></button>
+          <button id="traffic-clear-btn" class="icon-btn" title="Clear traffic log"><i class="fa-solid fa-trash-can"></i></button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table id="traffic-table">
+          <thead>
+            <tr>
+              <th class="resizable">Time</th>
+              <th class="resizable">Source IP</th>
+              <th class="resizable">Destination</th>
+              <th class="resizable">Port</th>
+              <th class="resizable">Rule</th>
+              <th class="resizable">Proxy</th>
+              <th class="resizable">Status</th>
+              <th class="resizable">Size</th>
+            </tr>
+          </thead>
+          <tbody id="traffic-tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="traffic-stats">
+        <span id="traffic-count">Connections: 0</span>
+        <span id="traffic-bytes">&nbsp;|&nbsp;Bytes: 0 B</span>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ── Modals ──────────────────────────────────────────────────────── -->
+
+<div id="modal-backdrop" class="modal-backdrop hidden"></div>
+
+<div id="modal-add-rule" class="modal hidden">
+  <div class="modal-header">
+    <h3>Add Rule</h3>
+    <button id="af-cancel" class="modal-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <label class="dim-label">Name</label>
+  <input id="af-name" type="text">
+  <label class="dim-label">Patterns (one per line or ;)</label>
+  <textarea id="af-pattern" rows="3" placeholder="*.google.com&#10;*.youtube.com"></textarea>
+  <label class="dim-label">Proxy</label>
+  <select id="af-proxy"></select>
+  <label class="checkbox-row"><input id="af-enabled" type="checkbox" checked> Enabled</label>
+  <div class="btn-row modal-actions">
+    <button id="af-save" class="primary modal-confirm">Save</button>
+  </div>
+</div>
+
+<div id="modal-edit-rule" class="modal hidden">
+  <div class="modal-header">
+    <h3>Edit Rule</h3>
+    <button id="ef-cancel" class="modal-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <label class="dim-label">Name</label>
+  <input id="ef-name" type="text">
+  <label class="dim-label">Patterns (one per line or ;)</label>
+  <textarea id="ef-pattern" rows="3"></textarea>
+  <label class="dim-label">Proxy</label>
+  <select id="ef-proxy"></select>
+  <label class="checkbox-row"><input id="ef-enabled" type="checkbox"> Enabled</label>
+  <div class="btn-row modal-actions">
+    <button id="ef-save" class="primary modal-confirm">Save</button>
+  </div>
+</div>
+
+<div id="modal-add-proxy" class="modal hidden">
+  <div class="modal-header">
+    <h3>Add Proxy</h3>
+    <button id="apf-cancel" class="modal-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <label class="dim-label">Name</label>
+  <input id="apf-name" type="text">
+  <label class="dim-label">Type</label>
+  <select id="apf-type">
+    <option value="http">http</option>
+    <option value="socks5">socks5</option>
+    <option value="socks4">socks4</option>
+  </select>
+  <label class="dim-label">Host</label>
+  <input id="apf-host" type="text">
+  <label class="dim-label">Port</label>
+  <input id="apf-port" type="text">
+  <label class="dim-label">Login</label>
+  <input id="apf-login" type="text">
+  <label class="dim-label">Password</label>
+  <div class="pass-row">
+    <input id="apf-pass" type="password">
+    <button id="apf-pass-toggle" type="button">●</button>
+  </div>
+  <div class="btn-row modal-actions">
+    <button id="apf-save" class="primary modal-confirm">Save</button>
+  </div>
+</div>
+
+<div id="modal-edit-proxy" class="modal hidden">
+  <div class="modal-header">
+    <h3>Edit Proxy</h3>
+    <button id="epf-cancel" class="modal-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <label class="dim-label">Name</label>
+  <input id="epf-name" type="text">
+  <label class="dim-label">Type</label>
+  <select id="epf-type">
+    <option value="http">http</option>
+    <option value="socks5">socks5</option>
+    <option value="socks4">socks4</option>
+  </select>
+  <label class="dim-label">Host</label>
+  <input id="epf-host" type="text">
+  <label class="dim-label">Port</label>
+  <input id="epf-port" type="text">
+  <label class="dim-label">Login</label>
+  <input id="epf-login" type="text">
+  <label class="dim-label">Password</label>
+  <div class="pass-row">
+    <input id="epf-pass" type="password">
+    <button id="epf-pass-toggle" type="button">●</button>
+  </div>
+  <div class="btn-row modal-actions">
+    <button id="epf-save" class="primary modal-confirm">Save</button>
+  </div>
+</div>
+
+<div id="modal-add-device" class="modal hidden">
+  <div class="modal-header">
+    <h3>Add Device to Decrypt</h3>
+    <button id="adf-cancel" class="modal-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <label class="dim-label">Device currently on the hotspot</label>
+  <select id="adf-seen"></select>
+  <label class="dim-label">MAC address</label>
+  <input id="adf-mac" type="text" placeholder="aa:bb:cc:dd:ee:ff">
+  <label class="dim-label">Label (optional)</label>
+  <input id="adf-label" type="text" placeholder="e.g. Test phone">
+  <div class="btn-row modal-actions">
+    <button id="adf-save" class="primary modal-confirm">Save</button>
+  </div>
+</div>
+
+<div id="modal-settings" class="modal hidden">
+  <div class="modal-header">
+    <h3>Settings</h3>
+    <button id="sf-cancel" class="modal-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <label class="dim-label">WAN interface</label>
+  <select id="sf-wan"></select>
+  <button id="sf-detect" class="full-width">↺ Detect</button>
+  <label class="dim-label">Hotspot SSID</label>
+  <input id="sf-ssid" type="text">
+  <label class="dim-label">Hotspot password</label>
+  <div class="pass-row">
+    <input id="sf-pass" type="password">
+    <button id="sf-pass-toggle" type="button">●</button>
+  </div>
+  <label class="dim-label">Gateway IP (e.g. 192.168.100.1)</label>
+  <input id="sf-gw" type="text">
+  <label class="dim-label">WiFi adapter (* = auto)</label>
+  <input id="sf-wifi-if" type="text">
+  <label class="dim-label">WiFi band</label>
+  <select id="sf-band">
+    <option value="">Auto (let driver decide)</option>
+    <option value="bg">2.4 GHz</option>
+    <option value="a">5 GHz</option>
+  </select>
+  <label class="dim-label">
+    IPv6 for upstream proxies is handled automatically.
+  </label>
+  <div class="btn-row modal-actions">
+    <button id="sf-save" class="primary modal-confirm">Save</button>
+  </div>
+</div>
+
+<!-- ── Debug console overlay ───────────────────────────────────────── -->
+<div id="debug-panel" class="hidden">
+  <div id="debug-header">
+    <span>Debug Log <span id="debug-count">(0)</span></span>
+    <span>
+      <button id="debug-freeze" title="Freeze/unfreeze log scrolling">❚❚ Freeze</button>
+      <button id="debug-clear">Clear</button>
+      <button id="debug-close">×</button>
+    </span>
+  </div>
+  <div id="debug-body"></div>
+</div>
+
+<script src="/static/js/debug.js"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/undo.js"></script>
+<script src="/static/js/rules.js"></script>
+<script src="/static/js/proxies.js"></script>
+<script src="/static/js/devices.js"></script>
+<script src="/static/js/status.js"></script>
+<script src="/static/js/traffic.js"></script>
+<script src="/static/js/settings.js"></script>
+<script src="/static/js/main.js"></script>
+</body>
+</html>

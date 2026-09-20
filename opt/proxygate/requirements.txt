@@ -1,0 +1,29 @@
+# ProxyGate — Python dependencies
+# Python >= 3.10 required (mitmproxy constraint)
+#
+# Install into the project venv:
+#   python3 -m venv /opt/proxygate-venv
+#   /opt/proxygate-venv/bin/pip install -r requirements.txt
+
+# Web UI server — serves the control panel over the LAN
+flask>=3.0.0
+
+# Production WSGI server — Flask's built-in dev server is single-purpose and
+# explicitly not meant for continuous multi-client use (see its own startup
+# warning). Waitress is pure-Python (no C extensions/system deps beyond pip)
+# and handles concurrent requests from multiple LAN devices properly.
+waitress>=3.0.0
+
+# YAML parsing for rules.yaml and config.yaml
+pyyaml>=6.0
+
+# Transparent proxy + traffic interception
+mitmproxy>=10.0.0
+
+# Optional: PTR lookups for IP → hostname resolution in the traffic feed
+dnspython>=2.4.0
+
+# NOTE: SOCKS5/SOCKS4/HTTP upstream proxy routing no longer depends on
+# PySocks — it's hand-rolled in backend/mitm_logger.py so IPv6 destinations
+# work (PySocks unconditionally rejects IPv6) and HTTP CONNECT auth/headers
+# match what real-world proxy servers expect. No package needed here.
