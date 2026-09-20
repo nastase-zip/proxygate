@@ -38,6 +38,20 @@
   let rowCount = 0;
   let liveFailures = 0;
 
+  // Whether to render "QUIC (blocked)" rows at all — a pure display
+  // preference (see settings.js), not a server-side filter: the rows are
+  // still logged and still counted in /api/traffic stats either way, this
+  // just controls whether the traffic table shows them.
+  let showQuic = true;
+  try {
+    const stored = localStorage.getItem("proxygate_show_quic");
+    showQuic = stored === null ? true : stored === "1";
+  } catch (e) { /* ignore, default stays true */ }
+
+  function shouldRenderRow(row) {
+    return showQuic || row.protocol !== "QUIC (blocked)";
+  }
+
   function fmtBytes(n) {
     if (n < 1024) return `${n} B`;
     if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
@@ -57,17 +71,33 @@
     return "row-other";
   }
 
+  // Only these protocols ever have a flow_details row to show (see
+  // mitm_logger.py: only the request()/response() hooks — which fire for
+  // plain HTTP and decrypted HTTPS, never raw-TLS passthrough — insert into
+  // flow_details). Clicking any other row would always hit an empty state,
+  // so skip the click affordance entirely for them.
+  const DETAIL_CAPABLE_PROTOCOLS = new Set(["HTTP", "HTTPS"]);
+
   function buildRowEl(row) {
     const tr = document.createElement("tr");
     const proxy = row.proxy_used || "DIRECT";
     tr.className = rowClassForProxy(proxy, row.status_code);
     tr.dataset.id = String(row.id);
 
+    const protocol = row.protocol || "—";
+    tr.dataset.protocol = protocol;
+    if (DETAIL_CAPABLE_PROTOCOLS.has(protocol)) {
+      tr.classList.add("row-clickable");
+      tr.title = "Click to view request/response detail";
+      tr.addEventListener("click", () => window.PG.flowDetail.open(row.id, row));
+    }
+
     const cells = [
       fmtTime(row.timestamp),
       row.source_ip || "—",
       row.dest_host || "—",
       row.dest_port || "",
+      protocol,
       row.rule_matched || "—",
       proxy,
       row.status_code != null ? String(row.status_code) : "—",
@@ -138,8 +168,14 @@
         const tbody = document.getElementById("traffic-tbody");
         const frag = document.createDocumentFragment();
         for (let i = rows.length - 1; i >= 0; i--) {
-          frag.appendChild(buildRowEl(rows[i]));
-          rowCount++;
+          // Cursor tracking below stays based on the full server-returned
+          // set regardless of this filter — only the DOM append is skipped,
+          // so pagination cursors never drift out of sync with what the
+          // server actually has.
+          if (shouldRenderRow(rows[i])) {
+            frag.appendChild(buildRowEl(rows[i]));
+            rowCount++;
+          }
         }
         tbody.insertBefore(frag, tbody.firstChild);
 
@@ -203,6 +239,7 @@
     let matched = 0;
     for (const row of rows) {
       newestLoadedId = row.id;
+      if (!shouldRenderRow(row)) continue;
       if (filter) {
         const f = filter.toLowerCase();
         const hit = (row.dest_host || "").toLowerCase().includes(f) || (row.source_ip || "").toLowerCase().includes(f);
@@ -261,7 +298,7 @@
   function onExport() {
     const tbody = document.getElementById("traffic-tbody");
     const rows = Array.from(tbody.querySelectorAll("tr"));
-    const headers = ["Time","Source IP","Destination","Port","Rule","Proxy","Status","Size"];
+    const headers = ["Time","Source IP","Destination","Port","Type","Rule","Proxy","Status","Size"];
     const lines = [headers.join(",")];
     for (const tr of rows) {
       const cells = Array.from(tr.querySelectorAll("td")).map((td) => `"${td.textContent.replace(/"/g, '""')}"`);
@@ -290,5 +327,18 @@
   document.addEventListener("DOMContentLoaded", init);
 
   window.PG = window.PG || {};
-  window.PG.traffic = { pollLive, loadOlderChunk };
+  function setShowQuic(show) {
+    showQuic = show;
+    // Toggle already-rendered rows in place rather than re-fetching/
+    // re-rendering the whole table — the rows are already in the DOM
+    // (tagged with data-protocol in buildRowEl), this is just a visibility
+    // flip, purely cosmetic and instant.
+    const tbody = document.getElementById("traffic-tbody");
+    for (const tr of tbody.querySelectorAll('tr[data-protocol="QUIC (blocked)"]')) {
+      tr.hidden = !show;
+    }
+    PG.log.info(TAG, "Show-QUIC preference changed", { show });
+  }
+
+  window.PG.traffic = { pollLive, loadOlderChunk, setShowQuic };
 })();

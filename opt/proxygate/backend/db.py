@@ -61,7 +61,7 @@ def get_connections_since(last_id: int, limit: int = 200) -> list[dict]:
         rows = conn.execute(
             """SELECT id, timestamp, source_ip, dest_host, dest_port,
                       method, status_code, bytes_transferred,
-                      rule_matched, proxy_used
+                      rule_matched, proxy_used, protocol
                FROM connections
                WHERE id > ?
                ORDER BY id ASC
@@ -101,7 +101,7 @@ def get_connections_filtered(
             rows = conn.execute(
                 """SELECT id, timestamp, source_ip, dest_host, dest_port,
                           method, status_code, bytes_transferred,
-                          rule_matched, proxy_used
+                          rule_matched, proxy_used, protocol
                    FROM connections
                    WHERE dest_host LIKE ? OR source_ip LIKE ?
                    ORDER BY id DESC
@@ -112,7 +112,7 @@ def get_connections_filtered(
             rows = conn.execute(
                 """SELECT id, timestamp, source_ip, dest_host, dest_port,
                           method, status_code, bytes_transferred,
-                          rule_matched, proxy_used
+                          rule_matched, proxy_used, protocol
                    FROM connections
                    ORDER BY id DESC
                    LIMIT ?""",
@@ -164,7 +164,7 @@ def get_history_page(
         rows = conn.execute(
             f"""SELECT id, timestamp, source_ip, dest_host, dest_port,
                        method, status_code, bytes_transferred,
-                       rule_matched, proxy_used
+                       rule_matched, proxy_used, protocol
                 FROM connections
                 WHERE {where}
                 ORDER BY id DESC
@@ -210,5 +210,29 @@ def resolve_host_from_cache(ip: str) -> Optional[str]:
         ).fetchone()
         conn.close()
         return row["hostname"] if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+def get_flow_details(connection_id: int) -> Optional[dict]:
+    """
+    Full request/response capture for one connection (Charles/Burp-style
+    detail view) — headers as newline-joined "Name: value" text, bodies as
+    raw bytes (decoded to str by the caller once it knows/guesses the
+    encoding; this layer stays encoding-agnostic). None if this connection
+    was never decrypted (raw-TLS passthrough never reaches the hooks that
+    populate flow_details) or the id doesn't exist.
+    """
+    try:
+        conn = _conn()
+        row = conn.execute(
+            """SELECT connection_id, request_headers, request_body, request_truncated,
+                      response_headers, response_body, response_truncated
+               FROM flow_details
+               WHERE connection_id = ?""",
+            (connection_id,),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
     except sqlite3.OperationalError:
         return None

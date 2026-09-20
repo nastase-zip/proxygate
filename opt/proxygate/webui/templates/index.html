@@ -24,12 +24,16 @@
         <span id="conn-indicator-text">connecting…</span>
       </span>
       <div id="sp-status-line" class="status-line"></div>
+      <div id="service-warning-line" class="service-warning hidden"></div>
       <div id="interface-conflict-banner" class="conflict-banner hidden"></div>
     </span>
 
     <span id="topbar-right">
       <button id="gw-toggle-btn" class="gw-idle">Connect</button>
       <button id="restart-mitm-btn" class="topbar-btn"><i class="fa-solid fa-rotate"></i> Restart mitmproxy</button>
+      <button id="mediastreamer-dns-btn" class="topbar-btn" title="Routes hotspot DNS through 85.203.37.1 / .2, falling back to normal DNS if both are unreachable. Briefly disconnects all hotspot devices while applying." disabled>
+        <i class="fa-solid fa-satellite-dish"></i> Mediastreamer DNS
+      </button>
       <div id="status-dropdown-wrap">
         <button id="status-dropdown-btn" class="icon-btn" title="System status"><i class="fa-solid fa-circle-info"></i></button>
         <div id="status-dropdown" class="hidden">
@@ -43,8 +47,11 @@
               <div class="stat-row"><span class="stat-key">AP interface</span><span class="stat-val" id="ap-interface">—</span></div>
               <div class="stat-row"><span class="stat-key">WAN interface</span><span class="stat-val" id="wan-interface">—</span></div>
               <div class="stat-row"><span class="stat-key">Hotspot IP</span><span class="stat-val" id="hotspot-ip">—</span></div>
-              <div class="stat-row"><span class="stat-key">Devices</span><span class="stat-val" id="hotspot-devices">0</span></div>
             </div>
+          </div>
+          <div class="status-drop-section">
+            <div class="status-drop-label">Devices (<span id="hotspot-devices">0</span>)</div>
+            <div id="hotspot-device-list" class="device-mini-list"></div>
           </div>
         </div>
       </div>
@@ -114,6 +121,7 @@
               <th class="resizable">Source IP</th>
               <th class="resizable">Destination</th>
               <th class="resizable">Port</th>
+              <th class="resizable">Type</th>
               <th class="resizable">Rule</th>
               <th class="resizable">Proxy</th>
               <th class="resizable">Status</th>
@@ -245,6 +253,32 @@
   </div>
 </div>
 
+<div id="modal-flow-detail" class="modal modal-wide hidden">
+  <div class="modal-header">
+    <h3 id="fd-title">Request Detail</h3>
+    <button id="fd-close" class="modal-close" title="Close" aria-label="Close">✕</button>
+  </div>
+  <div id="fd-empty" class="dim-label hidden">
+    No captured detail for this connection — it was raw-TLS passthrough (not decrypted) or not an HTTP/S flow, so there's nothing beyond what's already in the table row.
+  </div>
+  <div id="fd-body" class="fd-columns hidden">
+    <div class="fd-col">
+      <div class="fd-col-title">Request</div>
+      <div class="fd-section-label">Headers</div>
+      <pre id="fd-request-headers" class="fd-pre"></pre>
+      <div class="fd-section-label">Body <span id="fd-request-truncated" class="fd-truncated-badge hidden">truncated</span></div>
+      <pre id="fd-request-body" class="fd-pre fd-body-pre"></pre>
+    </div>
+    <div class="fd-col">
+      <div class="fd-col-title">Response</div>
+      <div class="fd-section-label">Headers</div>
+      <pre id="fd-response-headers" class="fd-pre"></pre>
+      <div class="fd-section-label">Body <span id="fd-response-truncated" class="fd-truncated-badge hidden">truncated</span></div>
+      <pre id="fd-response-body" class="fd-pre fd-body-pre"></pre>
+    </div>
+  </div>
+</div>
+
 <div id="modal-settings" class="modal hidden">
   <div class="modal-header">
     <h3>Settings</h3>
@@ -273,6 +307,10 @@
   <label class="dim-label">
     IPv6 for upstream proxies is handled automatically.
   </label>
+  <label class="checkbox-row">
+    <input id="sf-show-quic" type="checkbox">
+    Show blocked QUIC attempts in the traffic table
+  </label>
   <div class="btn-row modal-actions">
     <button id="sf-save" class="primary modal-confirm">Save</button>
   </div>
@@ -298,6 +336,7 @@
 <script src="/static/js/proxies.js"></script>
 <script src="/static/js/devices.js"></script>
 <script src="/static/js/status.js"></script>
+<script src="/static/js/flow-detail.js"></script>
 <script src="/static/js/traffic.js"></script>
 <script src="/static/js/settings.js"></script>
 <script src="/static/js/main.js"></script>

@@ -12,6 +12,7 @@ interface can open the UI in a browser and control the gateway.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -178,6 +179,20 @@ def get_settings():
     cfg = services.load_config()
     ifaces = services.list_network_interfaces()
     return _ok({"config": cfg, "interfaces": ifaces})
+
+
+@app.route("/api/settings/mediastreamer_dns", methods=["GET"])
+def get_mediastreamer_dns():
+    return _ok(services.mediastreamer_dns_status())
+
+
+@app.route("/api/settings/mediastreamer_dns", methods=["POST"])
+def set_mediastreamer_dns():
+    _log_request()
+    body = request.get_json(force=True, silent=True) or {}
+    enable = bool(body.get("enabled"))
+    ok, msg = services.set_mediastreamer_dns(enable)
+    return _ok(msg=msg) if ok else _err(msg, 500)
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -553,6 +568,52 @@ def remove_decrypt_device(mac: str):
     return _ok({"data": data}, msg) if ok else _err(msg, 500)
 
 
+# ── Blocked devices (kick/ban from the hotspot, by MAC) ───────────────────────
+#
+# A separate list from decrypt devices above — this is a network-level ban,
+# used from the status dropdown's device list (not the left-panel Devices
+# tab, which is decrypt opt-in only). See backend/rules.py's
+# blocked_devices.yaml docstring and services.block_device()'s docstring for
+# the full kick+ban mechanism.
+
+@app.route("/api/devices/blocked", methods=["GET"])
+def get_blocked_devices():
+    return _ok({"data": rules_mod.load_blocked_devices()})
+
+
+@app.route("/api/devices/blocked", methods=["POST"])
+def block_device():
+    _log_request()
+    body = request.get_json(force=True, silent=True) or {}
+    mac = (body.get("mac") or "").strip()
+    label = (body.get("label") or "").strip()
+    if not mac:
+        return _err("MAC address is required.")
+    ok, msg = services.block_device(mac, label)
+    return _ok({"data": rules_mod.load_blocked_devices()}, msg) if ok else _err(msg, 500)
+
+
+@app.route("/api/devices/blocked/<mac>", methods=["PUT"])
+def set_device_blocked(mac: str):
+    """The on/off toggle — flips enforcement without removing the entry, so
+    a device that's dropped off /api/devices/seen (because it's currently
+    blocked) can still be found here and re-enabled."""
+    _log_request()
+    body = request.get_json(force=True, silent=True) or {}
+    blocked = bool(body.get("blocked", True))
+    ok, msg = services.set_device_blocked(mac, blocked)
+    return _ok({"data": rules_mod.load_blocked_devices()}, msg) if ok else _err(msg, 500)
+
+
+@app.route("/api/devices/blocked/<mac>", methods=["DELETE"])
+def delete_blocked_device(mac: str):
+    """Fully remove the entry — unlike PUT .../blocked=false, it won't show
+    up in the blocked-devices list anymore at all."""
+    _log_request()
+    ok, msg = services.delete_blocked_device(mac)
+    return _ok({"data": rules_mod.load_blocked_devices()}, msg) if ok else _err(msg, 500)
+
+
 # mitmdump runs as root (see main.py's geteuid check), so its CA lives under
 # root's home — mitmproxy writes it here unconditionally on first launch.
 MITM_CA_CERT_PATH = os.path.expanduser("~root/.mitmproxy/mitmproxy-ca-cert.pem")
@@ -633,6 +694,35 @@ def traffic_history():
 
     rows = db.get_history_page(SESSION_FLOOR_ID, before_id=before_id, limit=limit, filter_text=filter_text)
     return _ok({"rows": rows, "has_more": len(rows) == limit})
+
+
+@app.route("/api/traffic/<int:connection_id>/detail")
+def traffic_detail(connection_id: int):
+    """
+    Full request/response capture for one connection (Charles/Burp-style
+    detail view) — only populated for flows that were actually decrypted;
+    everything else (the vast majority — raw-TLS passthrough) has none,
+    which is a normal, expected 404 here, not an error.
+
+    Bodies are base64-encoded for JSON transport since they're raw bytes
+    (BLOB) that may not be valid UTF-8 (images, protobuf, etc.) — the
+    frontend decides whether/how to render them as text.
+    """
+    detail = db.get_flow_details(connection_id)
+    if not detail:
+        return _err("No captured detail for this connection (not decrypted, or not an HTTP/S flow).", 404)
+
+    def _b64(b):
+        return base64.b64encode(b).decode("ascii") if b else None
+
+    return _ok({
+        "request_headers":    detail.get("request_headers"),
+        "request_body_b64":   _b64(detail.get("request_body")),
+        "request_truncated":  bool(detail.get("request_truncated")),
+        "response_headers":   detail.get("response_headers"),
+        "response_body_b64":  _b64(detail.get("response_body")),
+        "response_truncated": bool(detail.get("response_truncated")),
+    })
 
 
 # ── Client-side debug log sink ───────────────────────────────────────────────────

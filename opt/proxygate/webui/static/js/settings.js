@@ -8,6 +8,25 @@
 
   const TAG = "settings";
 
+  // Purely a display filter for the traffic table (whether to show
+  // "QUIC (blocked)" rows) — not gateway/network config, so it's a
+  // per-browser localStorage preference (same idea as dark mode in
+  // main.js) rather than a round-trip to /api/settings. Defaults to shown.
+  const SHOW_QUIC_KEY = "proxygate_show_quic";
+
+  function getShowQuic() {
+    try {
+      const v = localStorage.getItem(SHOW_QUIC_KEY);
+      return v === null ? true : v === "1";
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function setShowQuic(show) {
+    try { localStorage.setItem(SHOW_QUIC_KEY, show ? "1" : "0"); } catch (e) { /* ignore */ }
+  }
+
   function fillWanSelect(sel, interfaces, current) {
     sel.innerHTML = "";
     const items = ["(auto-detect)", ...interfaces];
@@ -34,6 +53,7 @@
       document.getElementById("sf-gw").value = cfg.hotspot_gw || "192.168.100.1";
       document.getElementById("sf-wifi-if").value = cfg.ap_wifi_if || "*";
       document.getElementById("sf-band").value = cfg.ap_band || "";
+      document.getElementById("sf-show-quic").checked = getShowQuic();
       PG.log.info(TAG, "Settings modal opened", { cfg });
       PG.showModal("modal-settings");
     } catch (e) {
@@ -70,9 +90,14 @@
       ap_wifi_if: document.getElementById("sf-wifi-if").value.trim() || "*",
       ap_band: document.getElementById("sf-band").value,
     };
+    // show-quic is a local display preference, not gateway config — saved
+    // straight to localStorage, no /api/settings round-trip involved.
+    const showQuic = document.getElementById("sf-show-quic").checked;
+    setShowQuic(showQuic);
+    window.PG.traffic && window.PG.traffic.setShowQuic(showQuic);
     try {
       const res = await PG.api.post("/api/settings", body);
-      PG.log.info(TAG, "Settings saved", { body: { ...body, ap_password: "***" } });
+      PG.log.info(TAG, "Settings saved", { body: { ...body, ap_password: "***" }, showQuic });
       PG.hideModal("modal-settings");
       window.PG.status && window.PG.status.setStatusLine(res.msg, false);
     } catch (e) {

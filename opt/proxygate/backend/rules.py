@@ -23,6 +23,7 @@ import yaml
 RULES_PATH   = os.getenv("PROXYGATE_RULES",   "/etc/proxygate/rules.yaml")
 CONFIG_PATH  = os.getenv("PROXYGATE_CONFIG",  "/etc/proxygate/config.yaml")
 DEVICES_PATH = os.getenv("PROXYGATE_DEVICES", "/etc/proxygate/devices.yaml")
+BLOCKED_DEVICES_PATH = os.getenv("PROXYGATE_BLOCKED_DEVICES", "/etc/proxygate/blocked_devices.yaml")
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -282,6 +283,95 @@ def decrypt_mac_set(data: dict) -> set[str]:
     return {_norm_mac(d["mac"]) for d in data.get("devices", []) if d.get("decrypt") and d.get("mac")}
 
 
+# ── Blocked devices (kicked from the hotspot, by MAC) ─────────────────────────
+#
+# A completely separate concept from decrypt opt-in above — this is a
+# network-level ban list. A device whose MAC is here AND has `blocked: true`
+# gets an immediate `iw station del` (instant WiFi deauth) when blocked, AND
+# every future connection attempt is dropped in iptables (PROXYGATE_BLOCKDEV,
+# applied by apply_iptables() in services.py) so it can't just reassociate a
+# moment later — "kick + block from reconnecting", not a one-off disconnect.
+# Deliberately its own file (not devices.yaml) since blocking a device from
+# the network and flagging it for TLS decryption are unrelated actions on
+# unrelated device sets.
+#
+# Entries persist here even once toggled off (`blocked: false`) rather than
+# being deleted — same idea as devices.yaml's decrypt flag: the device stays
+# in the list (with its last-known label) so it can be found and re-toggled
+# later, since it also stops appearing in /api/devices/seen the moment it's
+# actually kicked off the hotspot. An explicit delete (remove_blocked_device)
+# is the only thing that actually removes an entry.
+
+_DEFAULT_BLOCKED_DEVICES: dict = {"devices": []}
+
+
+def load_blocked_devices() -> dict:
+    if not os.path.exists(BLOCKED_DEVICES_PATH):
+        save_blocked_devices(_DEFAULT_BLOCKED_DEVICES)
+        return dict(_DEFAULT_BLOCKED_DEVICES)
+    try:
+        with open(BLOCKED_DEVICES_PATH) as f:
+            data = yaml.safe_load(f) or {}
+        return {**_DEFAULT_BLOCKED_DEVICES, **data}
+    except Exception:
+        return dict(_DEFAULT_BLOCKED_DEVICES)
+
+
+def save_blocked_devices(data: dict) -> None:
+    os.makedirs(os.path.dirname(BLOCKED_DEVICES_PATH), exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(BLOCKED_DEVICES_PATH))
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+        os.replace(tmp_path, BLOCKED_DEVICES_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def add_blocked_device(data: dict, mac: str, label: str = "") -> dict:
+    """Add (or re-block, if the entry already exists from a prior toggle-off)
+    `mac` to the list with blocked=True."""
+    mac = _norm_mac(mac)
+    devices = data.setdefault("devices", [])
+    for d in devices:
+        if _norm_mac(d.get("mac", "")) == mac:
+            d["blocked"] = True
+            if label:
+                d["label"] = label
+            return data
+    devices.append({"id": str(uuid.uuid4()), "mac": mac, "label": label, "blocked": True})
+    return data
+
+
+def set_blocked_device(data: dict, mac: str, blocked: bool) -> dict:
+    """Toggle an existing entry's enforcement on/off without removing it —
+    this is the on/off switch the UI's per-device toggle calls."""
+    mac = _norm_mac(mac)
+    for d in data.get("devices", []):
+        if _norm_mac(d.get("mac", "")) == mac:
+            d["blocked"] = blocked
+    return data
+
+
+def remove_blocked_device(data: dict, mac: str) -> dict:
+    """Fully delete the entry — unlike set_blocked_device(..., False), this
+    also removes it from the list, not just disables enforcement."""
+    mac = _norm_mac(mac)
+    data["devices"] = [d for d in data.get("devices", []) if _norm_mac(d.get("mac", "")) != mac]
+    return data
+
+
+def blocked_mac_set(data: dict) -> set[str]:
+    """MAC addresses currently ENFORCED as blocked (blocked=True) — a
+    toggled-off entry stays in the list but is excluded here, since
+    apply_iptables() only bans what this returns."""
+    return {_norm_mac(d["mac"]) for d in data.get("devices", []) if d.get("mac") and d.get("blocked")}
+
+
 def reload_rules(data: Optional[dict] = None) -> tuple[bool, str]:
     """
     1. Save rules.yaml.
@@ -316,5 +406,26 @@ def reload_devices(data: Optional[dict] = None) -> tuple[bool, str]:
             save_devices(data)
         _signal_mitm_reload()
         return True, "Devices updated"
+    except Exception as e:
+        return False, str(e)
+
+
+def reload_blocked_devices(data: Optional[dict] = None) -> tuple[bool, str]:
+    """
+    Save blocked_devices.yaml (if given) and reapply iptables — unlike the
+    decrypt device list, blocking is enforced by an actual iptables DROP
+    rule per MAC (PROXYGATE_BLOCKDEV, services.py), so a real rule change is
+    needed here, not just a hot-reload signal to mitmdump.
+    """
+    try:
+        if data is not None:
+            save_blocked_devices(data)
+        from backend.services import get_gateway_state, apply_iptables, GatewayState
+        state, _ = get_gateway_state()
+        if state == GatewayState.CONNECTED:
+            ok, msg = apply_iptables()
+            if not ok:
+                return False, msg
+        return True, "Blocked devices updated"
     except Exception as e:
         return False, str(e)

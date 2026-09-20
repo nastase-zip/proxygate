@@ -80,8 +80,14 @@ DB_PATH      = os.getenv("PROXYGATE_DB",      "/var/lib/proxygate/traffic.db")
 RULES_PATH   = os.getenv("PROXYGATE_RULES",   "/etc/proxygate/rules.yaml")
 DEVICES_PATH = os.getenv("PROXYGATE_DEVICES", "/etc/proxygate/devices.yaml")
 DNSMASQ_LOG  = os.getenv("DNSMASQ_LOG",       "/var/log/proxygate/dnsmasq.log")
+# Where apply_iptables()'s "PGQUIC: " LOG rule (services.py) actually lands —
+# rsyslog routes kernel LOG target output here on this distro. journalctl -k
+# would be the more portable way to read it, but tailing a plain file matches
+# the existing DnsLogTailer pattern and needs no subprocess.
+KERN_LOG     = os.getenv("KERN_LOG",          "/var/log/kern.log")
 
 _DNS_REPLY_RE = re.compile(r"\breply\s+(\S+)\s+is\s+(\d{1,3}(?:\.\d{1,3}){3})\b")
+_QUIC_LOG_RE  = re.compile(r"PGQUIC:.*\bSRC=(\S+).*\bDST=(\S+).*\bDPT=(\d+)")
 
 
 # ── Database helpers ──────────────────────────────────────────────────────────
@@ -107,7 +113,8 @@ def _init_db() -> None:
                 status_code       INTEGER,
                 bytes_transferred INTEGER,
                 rule_matched      TEXT,
-                proxy_used        TEXT
+                proxy_used        TEXT,
+                protocol          TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_connections_ts
                 ON connections(timestamp);
@@ -117,7 +124,30 @@ def _init_db() -> None:
                 hostname  TEXT NOT NULL,
                 seen_at   TEXT NOT NULL
             );
+
+            -- Full request/response capture for decrypted HTTPS flows (and
+            -- plain HTTP, which was already fully visible). One row per
+            -- connection that actually got decrypted — most rows in
+            -- `connections` never have one, since most traffic is raw-TLS
+            -- passthrough with no visibility into headers/body at all.
+            -- Bodies are capped (see _MAX_BODY_CAPTURE) so a large download/
+            -- video stream can't balloon the DB — this is a debugging/
+            -- inspection capture, not a full proxy replay archive.
+            CREATE TABLE IF NOT EXISTS flow_details (
+                connection_id     INTEGER PRIMARY KEY REFERENCES connections(id),
+                request_headers   TEXT,
+                request_body      BLOB,
+                request_truncated INTEGER NOT NULL DEFAULT 0,
+                response_headers  TEXT,
+                response_body     BLOB,
+                response_truncated INTEGER NOT NULL DEFAULT 0
+            );
         """)
+        # Older DBs created before `protocol` existed — add it if missing so
+        # upgrading in place doesn't require deleting traffic.db.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(connections)")]
+        if "protocol" not in cols:
+            conn.execute("ALTER TABLE connections ADD COLUMN protocol TEXT")
     conn.close()
 
 
@@ -130,24 +160,79 @@ def _insert_connection(
     bytes_xfer: int,
     rule_matched: str,
     proxy_used: str,
-) -> None:
+    protocol: Optional[str] = None,
+) -> Optional[int]:
+    """Insert a connections row and return its id (None on failure) — the
+    caller needs the id to attach flow_details for a decrypted flow."""
     try:
         conn = _get_conn()
         with conn:
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO connections
                    (timestamp, source_ip, dest_host, dest_port, method,
-                    status_code, bytes_transferred, rule_matched, proxy_used)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status_code, bytes_transferred, rule_matched, proxy_used, protocol)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     source_ip, dest_host, dest_port, method,
-                    status_code, bytes_xfer, rule_matched, proxy_used,
+                    status_code, bytes_xfer, rule_matched, proxy_used, protocol,
+                ),
+            )
+            row_id = cur.lastrowid
+        conn.close()
+        return row_id
+    except Exception:
+        return None
+
+
+# Charles/Burp-style capture is a debugging aid, not a full replay archive —
+# cap body storage so one large download/video stream can't balloon the DB.
+_MAX_BODY_CAPTURE = 1 * 1024 * 1024  # 1 MiB per direction
+
+
+def _insert_flow_details(
+    connection_id: Optional[int],
+    request_headers: Optional[str],
+    request_body: Optional[bytes],
+    response_headers: Optional[str],
+    response_body: Optional[bytes],
+) -> None:
+    if not connection_id:
+        return
+    try:
+        req_truncated = bool(request_body and len(request_body) > _MAX_BODY_CAPTURE)
+        resp_truncated = bool(response_body and len(response_body) > _MAX_BODY_CAPTURE)
+        req_body = request_body[:_MAX_BODY_CAPTURE] if request_body else None
+        resp_body = response_body[:_MAX_BODY_CAPTURE] if response_body else None
+        conn = _get_conn()
+        with conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO flow_details
+                   (connection_id, request_headers, request_body, request_truncated,
+                    response_headers, response_body, response_truncated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    connection_id, request_headers, req_body, int(req_truncated),
+                    response_headers, resp_body, int(resp_truncated),
                 ),
             )
         conn.close()
     except Exception:
         pass
+
+
+# ── Protocol classification (for the traffic table's "Type" column) ──────────
+#
+# Best-effort label from what's actually observable at each hook — not a deep
+# packet inspection feature. QUIC/HTTP3 (UDP/443) never reaches mitmproxy at
+# all (see apply_iptables() in services.py: all UDP from the hotspot is
+# dropped, there's no UDP proxy path) — that's logged separately, from the
+# iptables LOG rule, by QuicLogTailer below, not from here.
+
+def _classify_protocol(dest_port: int, decrypted: bool, is_tls: bool) -> str:
+    if is_tls:
+        return "HTTPS" if decrypted else "TLS"
+    return "HTTP" if dest_port == 80 else "TCP"
 
 
 def _upsert_dns(ip: str, hostname: str) -> None:
@@ -697,67 +782,137 @@ class DevicesEngine:
             return mac.strip().lower().replace("-", ":") in self.decrypt_macs
 
 
-# ── Per-domain decrypt fallback ────────────────────────────────────────────────
+# ── Per-(device, domain) decrypt circuit breaker ──────────────────────────────
 #
 # Some apps (Hotstar, Disney+, etc.) pin their own certificate/key and will
 # NEVER accept mitmproxy's CA regardless of device trust settings — every
 # single connection to those domains would otherwise retry a doomed decrypt
 # handshake forever (the app itself hammers a rejected endpoint with fresh
-# connections). This is deliberately per-DOMAIN, not per-device: it doesn't
-# touch DevicesEngine or the device's decrypt flag at all, so a device stays
-# flagged and every OTHER domain still gets decrypted normally — only the
-# specific domains that have proven they'll reject our cert fall back to raw
-# passthrough, exactly like a non-flagged device would see for that one host.
+# connections). But a domain rejecting the cert on ONE device says nothing
+# about whether it'll reject it on a DIFFERENT device — a device with the CA
+# genuinely trusted (system-level, or an app without pinning) should still
+# get a real attempt at that same domain. So this is keyed by (mac, domain),
+# not domain alone — the earlier all-devices-share-one-blocklist version
+# meant a single failure from any device silently killed decryption for that
+# domain everywhere, including devices that would have succeeded.
 #
-# Deliberately in-memory only (not persisted) — this is a live circuit
-# breaker for the current mitmdump process's lifetime, not a permanent
-# per-domain policy; a restart gives every domain a fresh attempt in case the
-# app/CA situation changed.
+# 3 consecutive failures for a given (mac, domain) trips the breaker for 10
+# minutes (falls back to passthrough), then automatically allows one more
+# attempt — self-healing in case the CA/app situation changed (a newly
+# installed CA, an app update that stopped pinning, etc.) — rather than
+# either retrying forever (retry-storms an app that will never accept the
+# cert) or staying blocked until someone manually intervenes.
+#
+# Deliberately in-memory only (not persisted) — a restart gives every
+# (mac, domain) pair a fresh start.
 
-_domain_decrypt_blocked: set[str] = set()
-_domain_decrypt_lock = threading.Lock()
+_DECRYPT_FAIL_THRESHOLD = 3
+_DECRYPT_COOLDOWN_SECS = 600
 
-
-def _domain_blocked_from_decrypt(host: str) -> bool:
-    with _domain_decrypt_lock:
-        return host in _domain_decrypt_blocked
-
-
-def _block_domain_from_decrypt(host: str) -> None:
-    with _domain_decrypt_lock:
-        _domain_decrypt_blocked.add(host)
+_decrypt_breaker: dict[tuple[str, str], dict] = {}
+_decrypt_breaker_lock = threading.Lock()
 
 
-# IP -> MAC resolution, cached briefly — the source IP is stable per
-# connection but re-resolving via dnsmasq leases/ARP on every single
-# tls_clienthello would mean a subprocess-adjacent file read per TLS
-# handshake. A short TTL keeps a MAC flip (rare on a live hotspot lease)
-# from being invisible for more than a couple seconds.
-_mac_cache: dict[str, tuple[float, Optional[str]]] = {}
-_mac_cache_lock = threading.Lock()
-_MAC_CACHE_TTL = 5.0
+def _breaker_key(mac: str, host: str) -> tuple[str, str]:
+    return (mac.strip().lower().replace("-", ":"), host)
+
+
+def _domain_blocked_from_decrypt(mac: str, host: str) -> bool:
+    key = _breaker_key(mac, host)
+    now = time.time()
+    with _decrypt_breaker_lock:
+        state = _decrypt_breaker.get(key)
+        if not state:
+            return False
+        if state["fails"] < _DECRYPT_FAIL_THRESHOLD:
+            return False
+        if now - state["tripped_at"] >= _DECRYPT_COOLDOWN_SECS:
+            # Cooldown elapsed — allow exactly one more attempt. If it fails
+            # again, note_decrypt_failure() below re-trips the breaker with a
+            # fresh tripped_at, restarting the cooldown.
+            state["fails"] = 0
+            return False
+        return True
+
+
+def _note_decrypt_failure(mac: str, host: str) -> None:
+    key = _breaker_key(mac, host)
+    with _decrypt_breaker_lock:
+        state = _decrypt_breaker.setdefault(key, {"fails": 0, "tripped_at": 0.0})
+        state["fails"] += 1
+        if state["fails"] >= _DECRYPT_FAIL_THRESHOLD:
+            state["tripped_at"] = time.time()
+
+
+def _note_decrypt_success(mac: str, host: str) -> None:
+    key = _breaker_key(mac, host)
+    with _decrypt_breaker_lock:
+        _decrypt_breaker.pop(key, None)
+
+
+# IP -> MAC resolution — MUST NEVER BLOCK, because tls_clienthello is a
+# synchronous hook that mitmproxy calls directly from its asyncio event
+# loop, not something we can `await` an executor future from. The previous
+# version called backend.services.resolve_mac() inline on every cache miss —
+# harmless for the dnsmasq-leases path (a plain file read) but its ARP
+# fallback shells out to `ip -4 neigh show` via subprocess.run(), which
+# blocks the ENTIRE event loop (every other in-flight TLS handshake on
+# every device) for however long that subprocess takes. Confirmed as the
+# actual cause of a burst of "client disconnected during the handshake"
+# failures (as opposed to real "does not trust the proxy's certificate"
+# rejections) — 7+ failures within a 16ms window, consistent with a stalled
+# event loop losing races against a device (iOS in particular) that opens
+# many parallel speculative connections and kills whichever don't respond
+# in time. That failure mode has nothing to do with CA trust and was made
+# worse, not better, by retrying — the stall was the cause of the retries.
+#
+# Fix: a background thread refreshes a full ip->mac snapshot on its own
+# schedule (mirrors RulesWatcher/DnsLogTailer's poll-loop pattern already
+# used elsewhere in this file); _resolve_mac() only ever reads that
+# snapshot in-line, synchronously, with no I/O of its own. Worst case this
+# is a few seconds stale (a device's MAC changing mid-session is rare on a
+# live hotspot lease anyway); that staleness is a fully acceptable trade for
+# never stalling the proxy's entire event loop again.
+
+_mac_snapshot: dict[str, str] = {}
+_mac_snapshot_lock = threading.Lock()
+_MAC_SNAPSHOT_REFRESH_SECS = 3.0
 
 
 def _resolve_mac(ip: str) -> Optional[str]:
-    now = time.time()
-    with _mac_cache_lock:
-        cached = _mac_cache.get(ip)
-        if cached and (now - cached[0]) < _MAC_CACHE_TTL:
-            return cached[1]
-    try:
-        from backend.services import resolve_mac
-        mac = resolve_mac(ip)
-    except Exception:
-        # Logged (not silently swallowed) specifically because an import
-        # failure here looks identical to "MAC just isn't resolvable yet"
-        # otherwise — and the consequence isn't cosmetic: should_decrypt()
-        # always returns False when mac is None, so decryption silently
-        # never engages for ANY device until this is diagnosed and fixed.
-        _log.debug(f"[proxygate] _resolve_mac({ip!r}) failed: {traceback.format_exc()}")
-        mac = None
-    with _mac_cache_lock:
-        _mac_cache[ip] = (now, mac)
-    return mac
+    with _mac_snapshot_lock:
+        return _mac_snapshot.get(ip)
+
+
+class MacSnapshotRefresher:
+    """Background-only IP->MAC table refresh — see _resolve_mac's docstring
+    for why this can never run inline from tls_clienthello."""
+    def __init__(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="mac-snapshot-refresher"
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                from backend.services import list_hotspot_devices
+                devices = list_hotspot_devices()
+                snapshot = {d["ip"]: d["mac"] for d in devices if d.get("ip") and d.get("mac")}
+                with _mac_snapshot_lock:
+                    _mac_snapshot.clear()
+                    _mac_snapshot.update(snapshot)
+            except Exception:
+                # Logged at debug, not silently swallowed to nothing — an
+                # import/subprocess failure here means MAC resolution goes
+                # stale (old snapshot keeps serving) rather than never
+                # working at all, which is a much softer failure mode than
+                # the old inline version's "decryption silently never
+                # engages for ANY device" when resolution broke.
+                _log.debug(f"[proxygate] MacSnapshotRefresher: {traceback.format_exc()}")
+            time.sleep(_MAC_SNAPSHOT_REFRESH_SECS)
 
 
 # ── Watcher ───────────────────────────────────────────────────────────────────
@@ -846,6 +1001,61 @@ class DnsLogTailer:
                     _upsert_dns(m.group(2), m.group(1))
 
 
+# ── QUIC-blocked-attempt log tailer ───────────────────────────────────────────
+#
+# QUIC/HTTP3 runs over UDP/443, which never reaches mitmproxy — all UDP from
+# the hotspot is dropped at the firewall (see apply_iptables() in
+# services.py; there's no UDP proxy path). Logging these as their own
+# "QUIC (blocked)" traffic-table rows, rather than silently dropping them
+# with no visibility at all, is what the "--dport 443 -j LOG" rule added
+# there is for. This only ever produces informational rows (no proxy/rule
+# was applied, nothing was actually forwarded) — the connection itself was
+# dropped, exactly as it always was; this tailer doesn't change that.
+
+class QuicLogTailer:
+    def __init__(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="quic-log-tailer"
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                self._tail()
+            except Exception:
+                time.sleep(5)
+
+    def _tail(self) -> None:
+        while not os.path.exists(KERN_LOG):
+            time.sleep(2)
+        with open(KERN_LOG, "r") as fh:
+            fh.seek(0, 2)
+            while True:
+                line = fh.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                m = _QUIC_LOG_RE.search(line)
+                if not m:
+                    continue
+                src_ip, dst_ip, dst_port = m.group(1), m.group(2), int(m.group(3))
+                display_host = resolve_host(dst_ip)
+                _insert_connection(
+                    source_ip    = src_ip,
+                    dest_host    = display_host,
+                    dest_port    = dst_port,
+                    method       = None,
+                    status_code  = None,
+                    bytes_xfer   = 0,
+                    rule_matched = "—",
+                    proxy_used   = "BLOCKED",
+                    protocol     = "QUIC (blocked)",
+                )
+
+
 # ── mitmproxy addon ───────────────────────────────────────────────────────────
 
 class ProxyGateAddon:
@@ -857,6 +1067,10 @@ class ProxyGateAddon:
         self._watcher.start()
         self._tailer  = DnsLogTailer()
         self._tailer.start()
+        self._quic_tailer = QuicLogTailer()
+        self._quic_tailer.start()
+        self._mac_refresher = MacSnapshotRefresher()
+        self._mac_refresher.start()
         _log.info("[proxygate] addon loaded")
 
     def running(self) -> None:
@@ -906,17 +1120,20 @@ class ProxyGateAddon:
             # mitmproxy's own CA — every other device keeps the original raw-TLS
             # passthrough. See DevicesEngine's docstring for the full rationale.
             #
-            # Per-domain fallback: a domain that has already proven (this
-            # process's lifetime) that it rejects our cert — cert pinning,
-            # typically — skips straight to passthrough instead of repeating a
-            # handshake we already know will fail. This is scoped to the
-            # domain, not the device: every OTHER domain for this same device
-            # still gets decrypted normally.
+            # Per-(device, domain) circuit breaker: a domain that has already
+            # failed 3 times in a row for THIS SPECIFIC device (cert pinning,
+            # typically) skips straight to passthrough for 10 minutes instead
+            # of repeating a handshake we already know will fail — then
+            # allows one more attempt automatically. A different device
+            # hitting the same domain is unaffected; see
+            # _domain_blocked_from_decrypt's docstring.
             mac = _resolve_mac(src_ip)
-            decrypt = self.devices.should_decrypt(mac) and not _domain_blocked_from_decrypt(display_host)
+            decrypt = self.devices.should_decrypt(mac) and mac and not _domain_blocked_from_decrypt(mac, display_host)
             data.ignore_connection = not decrypt
             if decrypt:
                 print(f"[proxygate] decrypting {src_ip} (mac={mac}) → {connect_host}:{dest_port}", flush=True)
+
+            protocol = _classify_protocol(dest_port, decrypted=decrypt, is_tls=True)
 
             _insert_connection(
                 source_ip    = src_ip,
@@ -927,6 +1144,7 @@ class ProxyGateAddon:
                 bytes_xfer   = 0,
                 rule_matched = rule_name,
                 proxy_used   = target,
+                protocol     = protocol,
             )
 
         except Exception:
@@ -936,32 +1154,34 @@ class ProxyGateAddon:
             except Exception:
                 pass
 
-    # ── TLS decrypt outcome (per-domain passthrough fallback) ──────────────────
+    # ── TLS decrypt outcome (per-device, per-domain circuit breaker) ───────────
     #
     # Fires once per failed handshake. If the client rejected our cert (as
-    # opposed to some other TLS error), mark that destination as a permanent
-    # passthrough for the rest of this mitmdump process — the device stays
-    # flagged for decrypt and every other destination is unaffected. This is
-    # what stops a pinned app (Hotstar, Disney+, etc.) from retry-hammering a
-    # doomed handshake indefinitely, without disabling decryption device-wide
-    # the way the old auto-revert did.
+    # opposed to some other TLS error), note a failure for THIS (mac, domain)
+    # pair — after 3 in a row it falls back to passthrough for 10 minutes,
+    # then gets one more attempt automatically. Scoped to the device that
+    # actually failed: a different device is never affected by this.
     #
-    # Key must match tls_clienthello's `display_host` exactly, or the block
-    # silently never applies. tls_clienthello uses `sni or resolve_host(dest_ip)`
-    # — a bare-IP connection (no SNI at all, e.g. some CDN edge/app traffic)
-    # still gets a real key there (the IP itself, since resolve_host() is a
-    # no-op when there's no PTR record). Reading only `data.conn.sni` here
-    # missed that case entirely: dest was None for every IP-literal
-    # connection, so those never got blocked and kept retrying a doomed
-    # decrypt handshake forever — confirmed happening in practice against
-    # 146.70.15.2 / 173.239.200.129 (both reachable, both just don't have a
-    # PTR record, so they never carry an SNI to key on).
+    # Key must match tls_clienthello's `display_host` exactly, or the
+    # breaker silently never applies. tls_clienthello uses
+    # `sni or resolve_host(dest_ip)` — a bare-IP connection (no SNI at all,
+    # e.g. some CDN edge/app traffic) still gets a real key there (the IP
+    # itself, since resolve_host() is a no-op when there's no PTR record).
+    # Reading only `data.conn.sni` here missed that case entirely: dest was
+    # None for every IP-literal connection, so those never tripped the
+    # breaker and kept retrying a doomed decrypt handshake forever —
+    # confirmed happening in practice against 146.70.15.2 / 173.239.200.129
+    # (both reachable, both just don't have a PTR record, so they never
+    # carry an SNI to key on).
 
     def tls_failed_client(self, data) -> None:
         try:
             err = getattr(data.conn, "error", None) or ""
-            if "does not trust the proxy" not in err and "certificate unknown" not in err:
-                return  # some other TLS failure — not a cert-pinning/trust rejection
+            peername = getattr(data.conn, "peername", None)
+            src_ip = peername[0] if peername else None
+            mac = _resolve_mac(src_ip) if src_ip else None
+            if not mac:
+                return
             sni = getattr(data.conn, "sni", None)
             if sni:
                 dest = sni
@@ -976,12 +1196,30 @@ class ProxyGateAddon:
                 dest = resolve_host(server_addr[0]) if server_addr else None
             if not dest:
                 return
-            if not _domain_blocked_from_decrypt(dest):
-                _block_domain_from_decrypt(dest)
-                print(f"[proxygate] {dest} rejects our CA — falling back to passthrough "
-                      f"for this domain (device stays decrypt-enabled)", flush=True)
+            if "does not trust the proxy" not in err and "certificate unknown" not in err:
+                return  # some other TLS failure — not a cert-pinning/trust rejection
+            _note_decrypt_failure(mac, dest)
+            print(f"[proxygate] {dest} rejected our CA for mac={mac} "
+                  f"(strike toward this device+domain's retry breaker)", flush=True)
         except Exception:
             _log.debug(f"[proxygate] tls_failed_client: {traceback.format_exc()}")
+
+    def tls_established_client(self, data) -> None:
+        """A decrypted handshake actually succeeded — clear any prior failure
+        streak for this (mac, domain) so it doesn't carry stale strikes."""
+        try:
+            peername = getattr(data.conn, "peername", None)
+            src_ip = peername[0] if peername else None
+            if not src_ip:
+                return
+            mac = _resolve_mac(src_ip)
+            if not mac:
+                return
+            sni = getattr(data.conn, "sni", None)
+            if sni:
+                _note_decrypt_success(mac, sni)
+        except Exception:
+            _log.debug(f"[proxygate] tls_established_client: {traceback.format_exc()}")
 
     # ── HTTP request ──────────────────────────────────────────────────────────
 
@@ -1049,7 +1287,15 @@ class ProxyGateAddon:
             req_size  = len(flow.request.content)  if flow.request  and flow.request.content  else 0
             resp_size = len(flow.response.content) if flow.response and flow.response.content else 0
 
-            _insert_connection(
+            # This hook fires for BOTH plain HTTP and decrypted HTTPS flows
+            # (mitmproxy only calls request()/response() once TLS is actually
+            # terminated — a raw-passthrough flow never reaches here at all,
+            # which is exactly why it never had status codes before). scheme
+            # tells them apart for the Type column.
+            is_https = flow.request.scheme == "https" if flow.request else False
+            protocol = _classify_protocol(port, decrypted=is_https, is_tls=is_https)
+
+            connection_id = _insert_connection(
                 source_ip    = src,
                 dest_host    = host,
                 dest_port    = port,
@@ -1058,7 +1304,27 @@ class ProxyGateAddon:
                 bytes_xfer   = req_size + resp_size,
                 rule_matched = meta.get("rule_matched", "default"),
                 proxy_used   = meta.get("proxy_used",   "DIRECT"),
+                protocol     = protocol,
             )
+
+            # Full request/response capture — Charles/Burp-style detail view.
+            # Only meaningful for flows we actually had visibility into
+            # (i.e. every flow that reaches this hook at all); a plain HTTP
+            # flow always did, a decrypted HTTPS flow only reaches here
+            # because DevicesEngine + the circuit breaker allowed decryption.
+            if flow.request:
+                req_headers = "\n".join(f"{k}: {v}" for k, v in flow.request.headers.items())
+                req_body = bytes(flow.request.content) if flow.request.content else None
+            else:
+                req_headers = None
+                req_body = None
+            if flow.response:
+                resp_headers = "\n".join(f"{k}: {v}" for k, v in flow.response.headers.items())
+                resp_body = bytes(flow.response.content) if flow.response.content else None
+            else:
+                resp_headers = None
+                resp_body = None
+            _insert_flow_details(connection_id, req_headers, req_body, resp_headers, resp_body)
         except Exception:
             ctx.log.debug(f"[proxygate] log error: {traceback.format_exc()}")
 
