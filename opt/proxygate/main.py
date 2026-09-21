@@ -47,11 +47,20 @@ def _shutdown(signum, _frame) -> None:
 
 
 def _setup_logging() -> None:
-    log_dir = "/var/log/proxygate"
+    _app_dir = os.path.dirname(os.path.abspath(__file__))       # .../opt/proxygate
+    _project_root = os.path.dirname(os.path.dirname(_app_dir))  # repo root
+    log_dir = os.path.join(_project_root, "var/log/proxygate")
     try:
+        from backend.rules import _restore_owner
+        log_existed = os.path.isdir(log_dir)
         os.makedirs(log_dir, exist_ok=True)
+        if not log_existed:
+            _restore_owner(log_dir, is_dir=True)
         log_file = os.path.join(log_dir, "web.log")
+        file_existed = os.path.exists(log_file)
         handlers = [logging.StreamHandler(sys.stdout), logging.FileHandler(log_file)]
+        if not file_existed:
+            _restore_owner(log_file)
     except Exception:
         handlers = [logging.StreamHandler(sys.stdout)]
 

@@ -36,10 +36,6 @@
     const devices = data.devices || [];
 
     if (!devices.length) {
-      const empty = document.createElement("div");
-      empty.className = "dim-label";
-      empty.textContent = "No devices flagged for decryption — all traffic uses raw TLS passthrough.";
-      list.appendChild(empty);
       return;
     }
 
@@ -144,11 +140,25 @@
     for (const d of seen) {
       const opt = document.createElement("option");
       opt.value = d.mac;
-      opt.textContent = `${d.ip}${d.hostname ? " — " + d.hostname : ""} (${d.mac})`;
+      // Lead with whatever identifies the device best — its DHCP hostname,
+      // else its MAC vendor — so the list is scannable instead of a column
+      // of near-identical IPs. display_name falls back to the IP itself.
+      const name = d.display_name || d.hostname || d.ip;
+      const detail = name === d.ip ? d.mac : `${d.ip} · ${d.mac}`;
+      opt.textContent = `${name} · ${detail}`;
       sel.appendChild(opt);
     }
     sel.onchange = () => {
-      if (sel.value) document.getElementById("adf-mac").value = sel.value;
+      if (!sel.value) return;
+      document.getElementById("adf-mac").value = sel.value;
+      // Pre-fill the label with the device's name so it's one less thing
+      // to type; still editable before saving.
+      const picked = seen.find((d) => d.mac === sel.value);
+      const labelEl = document.getElementById("adf-label");
+      if (picked && !labelEl.value) {
+        const n = picked.hostname || picked.vendor || "";
+        if (n) labelEl.value = n;
+      }
     };
     document.getElementById("adf-mac").value = "";
     document.getElementById("adf-label").value = "";

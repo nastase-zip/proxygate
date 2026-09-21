@@ -73,13 +73,22 @@ _APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
 
+# Imported after the sys.path fix above, for the reason documented there.
+# Shared with web.py so rule validation and rule matching agree exactly.
+from backend.patterns import matches_any  # noqa: E402
+
 _log = logging.getLogger(__name__)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DB_PATH      = os.getenv("PROXYGATE_DB",      "/var/lib/proxygate/traffic.db")
-RULES_PATH   = os.getenv("PROXYGATE_RULES",   "/etc/proxygate/rules.yaml")
-DEVICES_PATH = os.getenv("PROXYGATE_DEVICES", "/etc/proxygate/devices.yaml")
-DNSMASQ_LOG  = os.getenv("DNSMASQ_LOG",       "/var/log/proxygate/dnsmasq.log")
+# Self-contained under this checkout by default — see services.py's
+# PROJECT_ROOT comment.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_APP_ROOT))
+
+DB_PATH      = os.getenv("PROXYGATE_DB",      os.path.join(_PROJECT_ROOT, "var/lib/proxygate/traffic.db"))
+RULES_PATH   = os.getenv("PROXYGATE_RULES",   os.path.join(_PROJECT_ROOT, "etc/proxygate/rules.yaml"))
+DEVICES_PATH = os.getenv("PROXYGATE_DEVICES", os.path.join(_PROJECT_ROOT, "etc/proxygate/devices.yaml"))
+CONFIG_PATH  = os.getenv("PROXYGATE_CONFIG",  os.path.join(_PROJECT_ROOT, "etc/proxygate/config.yaml"))
+DNSMASQ_LOG  = os.getenv("DNSMASQ_LOG",       os.path.join(_PROJECT_ROOT, "var/log/proxygate/dnsmasq.log"))
 # Where apply_iptables()'s "PGQUIC: " LOG rule (services.py) actually lands —
 # rsyslog routes kernel LOG target output here on this distro. journalctl -k
 # would be the more portable way to read it, but tailing a plain file matches
@@ -99,7 +108,10 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _init_db() -> None:
+    from backend.rules import _restore_owner
+    db_existed = os.path.exists(DB_PATH)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    _restore_owner(os.path.dirname(DB_PATH), is_dir=True)
     conn = _get_conn()
     with conn:
         conn.executescript("""
@@ -149,6 +161,89 @@ def _init_db() -> None:
         if "protocol" not in cols:
             conn.execute("ALTER TABLE connections ADD COLUMN protocol TEXT")
     conn.close()
+    if not db_existed:
+        _restore_owner(DB_PATH)
+
+
+# ── Own-traffic filter ────────────────────────────────────────────────────────
+#
+# The gateway machine itself goes through the same proxy as its clients, so
+# without this its own requests (the browser running the web UI, package
+# managers, background OS chatter) land in the traffic table interleaved with
+# the hotspot clients' — indistinguishable to anyone reading the list, and by
+# far the noisiest source on the table. Only devices ON the hotspot are of
+# interest here, so anything originating from this machine is dropped at the
+# single insert chokepoint below.
+#
+# "This machine" means loopback, or the hotspot's own gateway address (the
+# address the AP interface holds, e.g. 192.168.100.1). Client traffic arrives
+# from elsewhere in the hotspot subnet, so it's never caught by this.
+
+# A second, related case: mitmproxy binds 0.0.0.0, so any machine that can
+# reach this box on the mitm port can use it as a proxy — the iptables
+# REDIRECT is correctly scoped to the hotspot NIC, but nothing stops a LAN
+# machine from connecting to the port directly. Such a device is not on the
+# hotspot and doesn't belong in a table that's meant to answer "what are the
+# devices on my hotspot doing", so the filter is expressed positively: keep
+# traffic from the hotspot subnet, drop everything else.
+
+_filter_cache: Optional[tuple[set[str], Optional[object]]] = None
+_filter_lock = threading.Lock()
+
+
+def _filter_config() -> tuple[set[str], Optional[object]]:
+    """
+    (own_ips, hotspot_subnet), cached for the process lifetime — both come
+    from config, not from anything that changes underneath a running
+    mitmproxy.
+    """
+    global _filter_cache
+    with _filter_lock:
+        if _filter_cache is not None:
+            return _filter_cache
+        ips = {"127.0.0.1", "::1"}
+        subnet = None
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = yaml.safe_load(f) or {}
+            gw = (cfg.get("hotspot_gw") or "").strip()
+            if gw:
+                ips.add(gw)
+            sub = (cfg.get("hotspot_subnet") or "").strip()
+            if sub:
+                subnet = ipaddress.ip_network(sub, strict=False)
+        except Exception:
+            # Fall back to dropping only our own traffic. Better to log a few
+            # extra rows than to silently drop a real client's by guessing at
+            # a subnet we couldn't read.
+            pass
+        _filter_cache = (ips, subnet)
+        _log.info(f"[proxygate] traffic filter: own={sorted(ips)} hotspot_subnet={subnet}")
+        return _filter_cache
+
+
+def _is_own_traffic(source_ip: Optional[str]) -> bool:
+    """
+    True when this row should NOT appear in the traffic table: it came from
+    the gateway machine itself, or from something that isn't on the hotspot
+    at all (e.g. a LAN machine using the mitm port as a plain proxy).
+    """
+    if not source_ip or source_ip == "?":
+        return False
+    ips, subnet = _filter_config()
+    raw = source_ip.strip()
+    if raw in ips:
+        return True
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    # Anything outside the hotspot subnet isn't a hotspot client.
+    if subnet is not None and addr.version == subnet.version:
+        return addr not in subnet
+    return False
 
 
 def _insert_connection(
@@ -163,7 +258,13 @@ def _insert_connection(
     protocol: Optional[str] = None,
 ) -> Optional[int]:
     """Insert a connections row and return its id (None on failure) — the
-    caller needs the id to attach flow_details for a decrypted flow."""
+    caller needs the id to attach flow_details for a decrypted flow.
+
+    Traffic from the gateway machine itself is dropped here rather than at
+    each call site: every logging path (HTTP, TLS passthrough, QUIC-blocked)
+    funnels through this one function, so one check covers them all."""
+    if _is_own_traffic(source_ip):
+        return None
     try:
         conn = _get_conn()
         with conn:
@@ -725,16 +826,18 @@ class RulesEngine:
             return self.proxies.get(target)
 
     def match(self, host: str) -> tuple[str, str]:
-        """Return (rule_name, target) — target is DIRECT, BLOCK, or a proxy name."""
+        """
+        Return (rule_name, target) — target is DIRECT, BLOCK, or a proxy name.
+
+        Splitting and matching both live in backend.patterns so this and the
+        API's validation can't disagree about what a rule means.
+        """
         with self._lock:
             for rule in self.rules:
                 if not rule.get("enabled", True):
                     continue
-                raw = rule.get("pattern", "").replace("\n", ";")
-                for pattern in raw.split(";"):
-                    pattern = pattern.strip()
-                    if pattern and (fnmatch.fnmatch(host, pattern) or fnmatch.fnmatch(host, pattern.lstrip("*."))):
-                        return rule["name"], rule["proxy"]
+                if matches_any(rule.get("pattern", ""), host):
+                    return rule["name"], rule["proxy"]
             return "default", self.default
 
 

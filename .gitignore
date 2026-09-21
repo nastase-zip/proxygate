@@ -1,2 +1,13 @@
-# Byte-compiled / optimized / DLL files
+# PyCache
 __pycache__/
+.pytest_cache/
+
+# Trusty helper
+.claude
+
+# Per-device state — never share another machine's connected/blocked device list
+etc/proxygate/devices.yaml
+etc/proxygate/blocked_devices.yaml
+etc/proxygate/config.yaml
+var/lib/proxygate/
+var/log/proxygate/

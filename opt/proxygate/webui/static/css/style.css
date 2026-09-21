@@ -13,8 +13,15 @@
   --border:    #b4b4b4;
   --topbar-bg: #d2d2d2;
   --th-bg:     #c8d7eb;
+  /* Traffic table column dividers. Separate from --border because these
+     run across the header band too, where --border has to stay legible
+     against --th-bg rather than against the panel background. */
+  --col-line:  #9aa7b8;
   --row-even:  #eeeeee;
   --row-border:#dddddd;
+  /* Alternating-row wash in the flow detail pane. Darkens here; the dark
+     theme lightens instead. */
+  --fd-stripe: rgba(0, 0, 0, 0.04);
 
   --row-direct:      rgba(34, 160, 80, 0.12);
   --row-expressvpn:  rgba(42, 106, 176, 0.14);
@@ -49,8 +56,12 @@ body.dark {
   --border:    #3a3a3a;
   --topbar-bg: #111111;
   --th-bg:     #2a3a50;
+  /* Lighter than --border (#3a3a3a), which all but disappears against the
+     #2a3a50 header blue. */
+  --col-line:  #8e97a5;
   --row-even:  #2a2a2a;
   --row-border:#333333;
+  --fd-stripe: rgba(255, 255, 255, 0.04);
 
   --row-direct:      rgba(30, 160, 80, 0.28);
   --row-expressvpn:  rgba(50, 110, 210, 0.32);
@@ -85,7 +96,16 @@ html, body {
 #app {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  /* 100% (not 100vh) — matching html/body's own height: 100% means all
+     three levels resolve from the same box instead of html/body sizing
+     off the viewport in one unit and #app in another. Two independent
+     viewport-based roundings (100% of html vs 100vh) can disagree by a
+     sub-pixel amount at certain fractional browser zoom levels (e.g.
+     175%), just enough for #app to end up a hair taller than body's
+     content box — which is what was forcing a native vertical scrollbar
+     even though body/html both already have overflow: hidden and no
+     panel actually needed to scroll. */
+  height: 100%;
 }
 
 #topbar {
@@ -95,8 +115,12 @@ html, body {
   padding: 6px 12px;
   background: var(--topbar-bg);
   border-bottom: 1px solid var(--border);
+  /* #app is a viewport-height flex column and the page itself never scrolls
+     (html/body are overflow: hidden), so not shrinking is what keeps this
+     bar on screen — everything below scrolls inside its own panel. */
   flex-shrink: 0;
   position: relative;
+  z-index: 10;
 }
 
 #topbar-left { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
@@ -171,6 +195,16 @@ html, body {
   gap: 4px;
   padding: 8px;
   min-height: 0;
+  /* Without this, #panels has no explicit overflow, which changes how
+     browsers apply the flexbox "automatic minimum size" algorithm to its
+     children — they can be sized using their true content height instead
+     of clamped to #panels' own allotted space. At most zoom levels the
+     difference rounds away to 0px, but nested flex column chains
+     (html -> body -> #app -> #panels -> .panel -> .table-wrap) can
+     accumulate independent per-level rounding, and above ~150% zoom that
+     compounds into a persistent few-px mismatch — exactly enough for a
+     scrollbar to appear despite there being no real overflowing content. */
+  overflow: hidden;
 }
 
 .panel {
@@ -186,10 +220,47 @@ html, body {
 
 /* Left panel: tabbed rules / proxies */
 #panel-left {
+  /* Overridden inline by main.js from the saved width. */
   width: 310px;
   flex-shrink: 0;
   padding: 0;
   overflow: hidden;
+}
+
+/* Vertical twin of #flow-pane-resize: only as tall as the grip itself, so
+   the resize cursor appears on the bar rather than the whole panel edge. */
+#panel-left-resize {
+  position: relative;
+  flex-shrink: 0;
+  width: 9px;
+  /* As a flex child this adds a second 4px gap, so the panels would sit
+     9px + 4px further apart. Pulling back 6.5px per side restores the
+     original 4px separation while keeping the grip centred in it. */
+  margin: 0 -6.5px;
+  align-self: center;
+  height: 72px;
+  cursor: col-resize;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#panel-left-resize::after {
+  content: "";
+  width: 3px;
+  height: 46px;
+  border-radius: 99px;
+  background: var(--border);
+  transition: background 0.12s ease, height 0.12s ease;
+}
+#panel-left-resize:hover::after,
+body.col-panel-resizing #panel-left-resize::after {
+  background: var(--accent);
+  height: 64px;
+}
+body.col-panel-resizing, body.col-panel-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 
 .left-tabs {
@@ -240,7 +311,6 @@ html, body {
 #panel-left.show-devices #panel-rules-inner   { display: none; }
 #panel-left.show-devices #panel-devices-inner { display: flex; }
 
-#devices-help { margin-bottom: 6px; line-height: 1.4; }
 #devices-footer {
   flex-shrink: 0;
   border-top: 1px solid var(--border);
@@ -369,13 +439,127 @@ input[type="text"], input[type="password"], select, textarea {
 textarea { resize: vertical; }
 input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
+/* ── dropdowns ────────────────────────────────────────────────────────
+   Native <select>, styled. A custom-rendered popup was tried and removed:
+   it could only open downward, so near a panel edge it was either clipped
+   or forced a scrollbar on its container. The OS popup places itself —
+   flipping up, scrolling, staying on screen — which is the behaviour worth
+   keeping. The closed control is fully themeable, so it matches the inputs
+   around it; the open list is drawn by the OS and can't be styled. */
+select {
+  /* Drop the platform's own control chrome so the border-radius and
+     background below actually apply (Firefox/WebKit/Blink all need this). */
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  cursor: pointer;
+  /* Room on the right for the chevron drawn as a background image. */
+  padding-right: 24px;
+  /* Two stacked chevron strokes, drawn in --text-dim. Inline SVG rather
+     than a Font Awesome glyph because a background can't hold an <i>. */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6' fill='none' stroke='%23646464' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M1 1l4 4 4-4'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 9px 6px;
+}
+select:hover { border-color: var(--accent); }
+/* The arrow is baked into the SVG's stroke, so dark mode needs its own
+   copy in the lighter --text-dim (#888). */
+body.dark select {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6' fill='none' stroke='%23888888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M1 1l4 4 4-4'/></svg>");
+}
+/* The popup list itself: honoured by Firefox and by Chromium's newer
+   customizable-select, ignored elsewhere (the OS draws its own). */
+select option {
+  background: var(--bg-light);
+  color: var(--text);
+}
+
 .dim-label { color: var(--text-dim); font-size: 11px; display: block; margin: 4px 0 2px; }
-.checkbox-row { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 12px; }
-.checkbox-row input { width: auto; margin: 0; }
+
+/* ── custom checkbox ──────────────────────────────────────────────────
+   The native input stays in the DOM so labels, keyboard focus and
+   :checked still work; it is made invisible and .pg-check-box draws the
+   box next to it. Reusable anywhere: wrap the input in .checkbox-row and
+   follow it with <span class="pg-check-box"><i class="fa-solid fa-check"></i></span>. */
+/* Only the box itself toggles the checkbox — the row is a plain <div>,
+   not a <label>, so clicking the text does nothing and the text stays
+   selectable. (As a <label> it forwarded clicks to the input, which
+   double-toggled every click on the box and made it look inert.) */
+.checkbox-row {
+  display: flex; align-items: flex-start; gap: 8px;
+  color: var(--text); font-size: 12px; line-height: 16px;
+  cursor: default;
+  padding: 2px 0;
+}
+.checkbox-row input[type="checkbox"] {
+  /* Kept in the DOM so .checked stays the source of truth, but never
+     shown or hit — .pg-check-box is the control. */
+  position: absolute;
+  width: 16px; height: 16px;
+  margin: 0; opacity: 0;
+  pointer-events: none;
+}
+.pg-check-box {
+  flex-shrink: 0;
+  cursor: pointer;
+  width: 16px; height: 16px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-light);
+  /* Centres the tick glyph optically: the flex centring alone leaves it
+     sitting low because the icon font's line box is taller than the
+     glyph. line-height:1 collapses that slack. */
+  display: flex; align-items: center; justify-content: center;
+  line-height: 1;
+  color: transparent;
+  font-size: 9px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+/* Labels share the box's 16px line-height (set on the row), so the first
+   line of text sits on the same centre line as the box. */
+.checkbox-row > span:not(.pg-check-box) { padding-top: 0; }
+.pg-check-box:hover { border-color: var(--accent); }
+.checkbox-row input[type="checkbox"]:checked + .pg-check-box {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.checkbox-row input[type="checkbox"]:focus-visible + .pg-check-box {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.checkbox-row input[type="checkbox"]:disabled + .pg-check-box { opacity: 0.45; }
+.checkbox-row input[type="checkbox"]:disabled ~ span { opacity: 0.45; }
 
 .pass-row { display: flex; gap: 4px; }
 .pass-row input { flex: 1; }
 .pass-row button { flex-shrink: 0; width: 32px; }
+
+/* Eye toggle: no fill, just the same hairline border the inputs use. The
+   icon itself is the only thing that changes between shown/hidden — the
+   colour stays put so the button doesn't flash a different state on
+   click; only hover brightens it. */
+.pass-toggle {
+  width: 32px;
+  /* The input carries a 6px bottom margin; match it so the row's boxes
+     stay the same height and bottom-aligned. */
+  margin-bottom: 6px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.pass-toggle:hover,
+.pass-toggle.on:hover { background: transparent; color: var(--text); border-color: var(--border); }
+.pass-toggle:active,
+.pass-toggle.on:active { background: transparent; }
+/* .on marks "password currently visible" — kept for the JS/aria state, but
+   deliberately styled identically so both icons read the same. */
+.pass-toggle.on { color: var(--text-dim); border-color: var(--border); }
 
 .field { margin: 4px 0; }
 
@@ -383,7 +567,6 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 .status-line.error { color: var(--error); }
 .status-line.ok { color: var(--ok); }
 .status-line.fading { opacity: 0; transition: opacity 0.25s ease; }
-.service-warning { font-size: 12px; color: var(--error); margin-top: 2px; }
 
 .conflict-banner {
   margin-top: 6px;
@@ -550,6 +733,14 @@ body.dark .rule-row.dragging {
 #services-list .svc-row { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; font-size: 12px; }
 #services-list .svc-name { min-width: 70px; }
 #services-list .svc-status { color: var(--text-dim); }
+/* Pushed to the far right of its row; the rows without one keep their
+   natural height because the button is sized to the 12px line. */
+#services-list .svc-action {
+  margin-left: auto;
+  width: 18px; height: 18px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
 
 .stat-grid {
   display: flex;
@@ -569,7 +760,8 @@ body.dark .rule-row.dragging {
   display: flex; align-items: center; gap: 6px;
   font-size: 11px; padding: 3px 2px; border-radius: 3px;
 }
-.device-mini-row:hover { background: rgba(255,255,255,0.05); }
+/* No row hover — the row isn't clickable, only the buttons in it are, so
+   a hover highlight just suggested an affordance that isn't there. */
 .device-mini-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .device-mini-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .device-mini-sub { color: var(--text-dim); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -579,11 +771,16 @@ body.dark .rule-row.dragging {
   display: flex; align-items: center; justify-content: center;
   background: transparent; border: none; color: var(--text-dim); font-size: 11px;
 }
-.device-mini-kick:hover { background: transparent; border: none; color: var(--error); }
-.device-mini-kick:active { background: transparent; }
+/* Both states stay grey; only hover lifts to full --text (white in dark
+   mode). Blocking a device is a normal toggle, not an error condition, so
+   nothing here goes red. */
+.device-mini-kick:hover { background: transparent; border: none; color: var(--text); }
+.device-mini-kick:active { background: transparent; border: none; }
 .device-mini-empty { color: var(--text-dim); font-size: 11px; }
-.device-mini-blocked { background: var(--row-error); opacity: 0.85; }
-.device-mini-blocked .device-mini-kick i.fa-wifi-slash { color: var(--error); }
+/* Blocked rows read as muted rather than alarming — the slashed icon and
+   the "offline (blocked)" sub-line already say what the state is. */
+.device-mini-blocked .device-mini-name { color: var(--text-dim); }
+
 
 .proxy-row {
   padding: 5px 6px;
@@ -646,19 +843,127 @@ body.dark .proxy-row:hover { background: rgba(255,255,255,0.06); }
 .traffic-toolbar button.active { background: var(--accent); }
 .toolbar-icon-group { display: flex; gap: 0; }
 
-.table-wrap { flex: 1; overflow: auto; border: 1px solid var(--border); background: var(--bg-light); min-height: 0; }
+/* Outer box: draws the border and background, and stacks the fixed header
+   bar above the scrolling area. */
+.table-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 4px; /* matches #flow-pane below it */
+  background: var(--bg-light);
+  display: flex;
+  flex-direction: column;
+}
 
-table { border-collapse: collapse; width: 100%; font-family: "DejaVu Sans Mono", "Liberation Mono", monospace; font-size: 11px; table-layout: fixed; }
+/* The header bar. A separate table outside the scroller, so it simply never
+   moves — no sticky positioning, nothing to fall out of sync. It sits in
+   normal flow above .table-scroll and so also reserves its own height,
+   which is what keeps the first rows from starting underneath it. */
+.table-head {
+  position: relative;
+  flex-shrink: 0;
+  z-index: 2;
+}
+
+/* The scrolling area: everything below the header bar. */
+.table-scroll {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  scrollbar-color: var(--text-dim) transparent;
+  /* Rows are only ever appended at the bottom (history loads once, up front
+     — see traffic.js), so nothing is inserted above the viewport and the
+     browser's scroll anchoring has nothing to correct. Left at the default
+     rather than disabled, so it can still hold position if content above
+     ever does change height. */
+  overflow-anchor: auto;
+}
+.table-scroll::-webkit-scrollbar { width: 16px; }
+.table-scroll::-webkit-scrollbar-track { background: transparent; }
+.table-scroll::-webkit-scrollbar-thumb {
+  background: var(--text-dim);
+  border-radius: 8px;
+  /* Inset the thumb from the track edges without shrinking the grab area. */
+  border: 4px solid transparent;
+  background-clip: content-box;
+}
+.table-scroll::-webkit-scrollbar-thumb:hover { background: var(--text); background-clip: content-box; }
+
+
+/* Column divider lines, drawn as an overlay independent of the table's own
+   rows — a <table> only ever sizes to its content, so per-cell borders
+   (used for the header/body portion) stop wherever the last row ends and
+   can't reach the bottom of the panel when there are only a few rows.
+   #traffic-col-lines sits in normal flow (not pinned to table-wrap's
+   viewport), stretched to the table's own rendered width by main.js, so it
+   scrolls together with the table instead of being clipped by table-wrap's
+   own overflow box or staying fixed while the table scrolls under it. Each
+   line is then absolutely positioned *within* that div at its column's
+   live boundary, and sized by main.js to the header row's height — the
+   dividers mark the header only, since running them through the rows
+   turns the table into a grid. Each line also hosts its column's drag
+   handle (see main.js). */
+/* Overlays the header bar (its parent .table-head is position: relative), so
+   the dividers and their drag handles sit ON the header rather than after it
+   in flow. Out of flow entirely, so it adds no height of its own. */
+#traffic-col-lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+.traffic-col-line {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  background: var(--col-line);
+}
+.traffic-col-line.active { background: var(--accent); width: 2px; }
+
+/* No width/min-width here on purpose — main.js (fitColumns) sets an explicit
+   pixel width matching exactly what the columns sum to. Any CSS width that
+   disagrees with that sum gets redistributed across every column by
+   table-layout: fixed, which is what used to make resizing one column
+   visibly move all the others. */
+table { border-collapse: collapse; font-family: "DejaVu Sans Mono", "Liberation Mono", monospace; font-size: 11px; table-layout: fixed; }
+/* No sticky positioning: the header is its own table in .table-head, which
+   sits outside the scrolling area entirely and therefore can't move. */
 thead th {
-  position: sticky; top: 0;
   background: var(--th-bg);
   text-align: left;
   padding: 4px 6px;
   border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+/* Text clipping lives on this inner span, not the th itself — th.resizable
+   needs overflow: visible so its resize handle can hang slightly outside
+   without being clipped, but that would otherwise let long header text
+   spill into neighboring columns instead of being ellipsis-truncated. */
+.th-label {
+  display: block;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  user-select: none;
+}
+/* Rows sit below the sticky header. The row tints (--row-direct etc.) are
+   semi-transparent, so without an explicit stacking order a row scrolling
+   under the header can paint over the header band instead of beneath it. */
+tbody tr {
+  position: relative;
+  z-index: 0;
+  /* Skip layout and paint for rows scrolled out of view. With a few hundred
+     rows this is what makes column dragging smooth — otherwise every width
+     change re-lays-out every row, on-screen or not. contain-intrinsic-size
+     supplies a placeholder height for the skipped ones so the scroll height
+     and scrollbar stay stable. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 19px;
 }
 tbody td { padding: 3px 6px; border-bottom: 1px solid var(--row-border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 tbody tr:nth-child(even) { background: var(--row-even); }
@@ -667,19 +972,42 @@ tbody tr.row-expressvpn { background: var(--row-expressvpn); }
 tbody tr.row-other      { background: var(--row-other); }
 tbody tr.row-error      { background: var(--row-error); }
 
-/* resizable column handle */
-th.resizable { position: relative; }
+th.resizable { position: relative; overflow: visible; }
+
+/* Invisible grab zone for resizing, hosted inside its .traffic-col-line
+   (see main.js for why it can't live in the th) and centered on it: the
+   line is 1px wide, so a 13px zone at left: -6px spans [-6, +7] around it.
+   Generous on purpose — the cursor shouldn't have to be pixel-accurate. */
 .col-resize-handle {
   position: absolute;
-  right: 0; top: 0; bottom: 0;
-  width: 5px;
+  left: -6px;
+  top: 0;
+  /* Header height only — NOT bottom: 0. The parent .traffic-col-line runs
+     the full panel height when full-height dividers are enabled, and
+     stretching the grab zone with it means the resize cursor appears (and a
+     drag can start) anywhere down the table body. --header-h is set by
+     main.js. */
+  height: var(--header-h, 100%);
+  width: 13px;
   cursor: col-resize;
   background: transparent;
+  /* The parent overlay is pointer-events: none so it never blocks clicks on
+     the table; re-enable them just for this hit area. */
+  pointer-events: auto;
 }
-.col-resize-handle:hover,
-.col-resize-handle.dragging { background: var(--accent); opacity: 0.5; }
-
-.traffic-stats { display: flex; margin-top: 4px; font-size: 12px; color: var(--text-dim); flex-shrink: 0; }
+/* While a divider is being dragged, every handle goes inert — otherwise the
+   cursor sweeping across neighbouring handles fires their hover styling and
+   they remain mousedown-able, so a second drag could start mid-drag. The
+   active drag doesn't need its handle: its listeners are on document. */
+#traffic-col-lines.dragging .col-resize-handle { pointer-events: none; }
+/* Keep the resize cursor for the whole drag (the handle under the pointer
+   is inert by then) and stop the drag from selecting header/row text. */
+body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none !important; }
+/* Not flex: as flex items the two spans are separate boxes, and a
+   drag-select across them skips the gap instead of selecting both as one
+   run of text. As inline text they select together. white-space: pre-wrap
+   keeps the padding spaces around the "|" from collapsing. */
+.traffic-stats { margin-top: 4px; font-size: 12px; color: var(--text-dim); flex-shrink: 0; white-space: pre-wrap; }
 
 /* ── modals ──────────────────────────────────────────────────────── */
 
@@ -689,55 +1017,329 @@ th.resizable { position: relative; }
 .modal {
   position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
   background: var(--bg-mid); border: 1px solid var(--border); border-radius: 6px;
-  padding: 16px; width: 380px; max-width: 92vw; max-height: 88vh; overflow-y: auto;
+  /* Side padding must match .modal-header's negative margin. */
+  padding: 0 14px 14px; width: 340px; max-width: 92vw; max-height: 88vh; overflow-y: auto;
   z-index: 101;
-  box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+  box-shadow: 0 10px 34px rgba(0,0,0,0.34);
 }
+/* The title used to sit on a solid blue band, which shouted louder than
+   anything in the form under it. Now it's part of the modal surface,
+   separated by a hairline instead of a colour block. */
 .modal-header {
+  /* Sticky so the title stays put on the taller forms (Settings, Proxy)
+     that scroll inside the modal. */
+  position: sticky; top: 0; z-index: 1;
   display: flex; align-items: center; justify-content: space-between;
-  color: #fff; background: var(--btn-bg);
-  padding: 8px 8px 8px 10px; margin: -16px -16px 12px;
+  color: var(--text); background: var(--bg-mid);
+  padding: 8px 14px; margin: 0 -14px 10px;
+  border-bottom: 1px solid var(--border);
   border-radius: 6px 6px 0 0;
 }
-.modal-header h3 { margin: 0; background: none; padding: 0; }
-.modal-close {
-  width: 26px; height: 26px; flex-shrink: 0; padding: 0;
-  display: flex; align-items: center; justify-content: center;
-  background: transparent; border: none; color: rgba(255,255,255,0.7);
-  font-size: 15px;
+/* h3 is styled globally for panel headings; inside a modal it's just a
+   title line, sized to the 12px form text rather than a heading. */
+.modal-header h3 {
+  margin: 0; background: none; padding: 0;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.2px;
+  color: var(--text);
 }
-.modal-close:hover { background: transparent; border: none; color: #fff; }
-.modal-close:active { background: transparent; }
+.modal-close {
+  width: 20px; height: 20px; flex-shrink: 0; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: none; color: var(--text-dim);
+  font-size: 12px;
+  border-radius: 3px;
+}
+.modal-close:hover { background: transparent; border: none; color: var(--text); }
+.modal-close:active { background: transparent; border: none; }
 
-.modal-actions { margin-top: 10px; }
+/* Give each label/field pair consistent breathing room. The labels carry
+   the spacing so stray margins on the fields themselves don't stack up. */
+.modal .dim-label { margin: 9px 0 3px; font-size: 11px; }
+.modal .dim-label:first-of-type { margin-top: 0; }
+.modal input[type="text"],
+.modal input[type="password"],
+.modal select,
+.modal textarea { margin-bottom: 0; padding: 6px 8px; border-radius: 4px; }
+/* Keeps room for the chevron that the shared padding shorthand above
+   would otherwise reset. */
+.modal select { padding-right: 24px; }
+.modal .pass-row .pass-toggle { margin-bottom: 0; border-radius: 4px; }
+.modal .checkbox-row { margin-top: 8px; }
+
+/* A helper button that belongs to the field above it (e.g. Detect). */
+.modal-inline-btn { margin-top: 6px; }
+
+.modal-note {
+  display: flex; align-items: flex-start; gap: 6px;
+  margin: 10px 0 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-light);
+  color: var(--text-dim);
+  font-size: 11px; line-height: 1.4;
+}
+.modal-note i { margin-top: 1px; flex-shrink: 0; }
+/* Inline pattern examples — monospace so the wildcards, quotes and escapes
+   are unambiguous at 11px. */
+.modal-note code {
+  font-family: monospace;
+  font-size: 10px;
+  color: var(--text);
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 3px;
+  white-space: nowrap;
+}
+
+.modal-actions { margin-top: 12px; }
+/* Sized to match the rest of the UI's buttons rather than towering over
+   the 12px form fields it sits under. */
 .modal-confirm {
-  width: 100%; height: 34px; font-size: 15px; font-weight: 700;
+  width: 100%; height: 26px; font-size: 12px; font-weight: 600;
   display: flex; align-items: center; justify-content: center;
 }
 .hidden { display: none !important; }
 
-/* ── flow detail viewer (Charles/Burp-style request/response) ──────── */
+/* ── flow detail viewer (Charles/Burp-style request/response) ──────────
+   Docked under the traffic table rather than shown in a modal, so the list
+   stays visible while you read a flow. Fixed height (drag the top edge to
+   change it, persisted per-browser), with the request/response columns
+   scrolling inside. */
 
-.modal-wide { width: 900px; max-width: 94vw; }
-
-.fd-columns { display: flex; gap: 12px; }
-.fd-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.fd-col-title { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
-.fd-section-label {
-  font-size: 11px; color: var(--text-dim); margin: 8px 0 3px;
-  display: flex; align-items: center; gap: 6px;
+#flow-pane {
+  position: relative;
+  flex-shrink: 0;
+  height: 260px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Room for the resize grip, which sits in this gap above the border. */
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-mid);
+  padding: 0 8px 8px;
 }
+#flow-pane.hidden { display: none; }
+
+/* Grab strip along the pane's top edge. */
+/* Only as wide as the grip itself — dragging is limited to the visible bar
+   rather than the whole pane edge, so the resize cursor doesn't appear
+   across the full width. Centered via the transform so the hit area and the
+   bar inside it stay concentric. */
+#flow-pane-resize {
+  position: absolute;
+  top: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 72px;
+  height: 9px;
+  cursor: row-resize;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#flow-pane-resize::after {
+  content: "";
+  width: 46px;
+  height: 3px;
+  border-radius: 99px;
+  background: var(--border);
+  transition: background 0.12s ease, width 0.12s ease;
+}
+#flow-pane-resize:hover::after,
+body.row-resizing #flow-pane-resize::after {
+  background: var(--accent);
+  width: 64px;
+}
+body.row-resizing, body.row-resizing * { cursor: row-resize !important; user-select: none !important; }
+
+#flow-pane-header {
+  /* No space-between: #fd-title takes the slack via flex: 1, which keeps the
+     status chip tight against the URL instead of pushed to the far edge. */
+  display: flex; align-items: center;
+  gap: 8px; flex-shrink: 0;
+  padding: 5px 0 4px;
+  font-size: 12px; font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+/* The URL takes the slack and is the only thing that truncates. */
+#flow-pane-header #fd-title {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; flex: 1;
+  font-weight: 600;
+}
+
+/* Sized to the header text it sits beside (12px), not larger: an outlined
+   box is already distinct enough without also being taller than the line.
+   line-height 1 + equal vertical padding is what actually centres the
+   digits inside the border — the default line-height left them sitting
+   high with the box stretched around the leading. */
+.fd-status {
+  flex-shrink: 0;
+  font-size: 10px; font-weight: 600;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  border: 1px solid var(--dim);
+  white-space: nowrap;
+}
+.fd-status.hidden { display: none; }
+.fd-status.fd-chip-ok    { color: var(--ok);    border-color: var(--ok); }
+.fd-status.fd-chip-warn  { color: var(--warn);  border-color: var(--warn); }
+.fd-status.fd-chip-error { color: var(--error); border-color: var(--error); }
+.fd-status.fd-chip-dim   { color: var(--dim);   border-color: var(--dim); }
+
+/* Transferred size, parked next to the close button. */
+.fd-size { flex-shrink: 0; font-size: 11px; font-weight: 400; color: var(--text-dim); white-space: nowrap; }
+
+/* Only shown when the URL is actually ellipsised. */
+.fd-copy { width: 24px; flex-shrink: 0; font-size: 12px; }
+.fd-copy.hidden { display: none; }
+
+/* Method, on the Request column's title line. */
+.fd-method {
+  font-size: 10px; font-weight: 700;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 5px;
+  margin-left: 4px;
+}
+.fd-method:empty { display: none; }
+
+/* The clicked row stays marked while its detail is open. */
+tbody tr.row-selected { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* Key facts lifted out of the headers, so the usual questions (what type,
+   how big, which server) don't need a header dump to answer. */
+.fd-summary {
+  display: flex; flex-wrap: wrap; gap: 4px 14px;
+  font-size: 11px; flex-shrink: 0;
+  padding-bottom: 6px; margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.fd-summary.hidden { display: none; }
+
+.fd-columns { display: flex; gap: 12px; flex: 1; min-height: 0; }
+.fd-col { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+
+.fd-col-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; flex-shrink: 0; margin-bottom: 4px;
+}
+.fd-col-title { font-size: 12px; font-weight: 700; }
+
+/* Headers/Body as tabs rather than two stacked boxes — one pane's worth of
+   height goes to whichever you're actually reading, instead of being split
+   between them. */
+.fd-tabs { display: flex; gap: 2px; }
+.fd-tab {
+  background: transparent; border: 1px solid transparent; color: var(--text-dim);
+  font-size: 11px; padding: 1px 7px; border-radius: 3px; cursor: pointer;
+  display: flex; align-items: center; gap: 4px;
+}
+.fd-tab:hover { background: transparent; border-color: var(--border); color: var(--text); }
+.fd-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.fd-count { opacity: 0.75; font-size: 10px; }
+
 .fd-truncated-badge {
   font-size: 10px; color: var(--warn); border: 1px solid var(--warn);
   border-radius: 3px; padding: 0 4px; text-transform: uppercase;
 }
-.fd-pre {
-  background: var(--bg-dark); border: 1px solid var(--border);
-  border-radius: 4px; padding: 6px 8px; font-size: 11px; font-family: monospace;
-  white-space: pre-wrap; word-break: break-word; overflow-x: auto;
-  max-height: 140px; overflow-y: auto; margin: 0;
+.fd-tab.active .fd-truncated-badge { color: #fff; border-color: #fff; }
+
+/* The scrollable content area. flex: 1 with min-height: 0 and NO min-height
+   floor: a floor would stop it shrinking when the pane is dragged small, and
+   the overflow would spill out past the pane over the stats line instead of
+   clipping and scrolling. */
+.fd-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg-dark);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  scrollbar-color: var(--text-dim) transparent;
 }
-.fd-body-pre { max-height: 260px; }
+.fd-view.hidden { display: none; }
+
+/* Wraps the body <pre> so the copy button can be pinned to the corner
+   without scrolling away with the content. */
+.fd-body-wrap { position: relative; overflow: hidden; }
+/* The inner <pre> does the scrolling, so the absolutely-positioned copy
+   button stays pinned to the wrapper's corner instead of scrolling away. */
+.fd-body-wrap .fd-pre {
+  height: 100%;
+  overflow: auto;
+  scrollbar-color: var(--text-dim) transparent;
+}
+.fd-body-wrap .fd-pre::-webkit-scrollbar { width: 14px; }
+.fd-body-wrap .fd-pre::-webkit-scrollbar-track { background: transparent; }
+.fd-body-wrap .fd-pre::-webkit-scrollbar-thumb {
+  background: var(--text-dim);
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+.fd-body-wrap .fd-pre::-webkit-scrollbar-thumb:hover {
+  background: var(--text); background-clip: content-box;
+}
+
+/* Always at full strength rather than fading in on hover — it's a primary
+   action on the body, not an easter egg. Sits at the wrapper's right edge
+   normally, and shifts in to clear the scrollbar only when one is actually
+   present. CSS can't branch on that (the gutter exists only while the
+   content overflows), so flow-detail.js measures it and sets
+   .fd-has-scroll on the wrapper. */
+.fd-body-copy {
+  position: absolute;
+  top: 4px; right: 4px;
+  z-index: 1;
+  width: 22px; height: 22px;
+  font-size: 11px;
+  border-radius: 3px;
+  background: var(--bg-mid);
+  border: 1px solid var(--border);
+  opacity: 1;
+  color: var(--text);
+}
+/* 14px scrollbar + 4px breathing room. */
+.fd-body-wrap.fd-has-scroll .fd-body-copy { right: 18px; }
+.fd-body-copy:hover {
+  background: var(--bg-mid);
+  border-color: var(--accent);
+  opacity: 1;
+  color: var(--text);
+}
+.fd-body-copy.hidden { display: none; }
+
+.fd-pre {
+  padding: 6px 8px; font-size: 11px; font-family: monospace;
+  white-space: pre-wrap; word-break: break-word; margin: 0;
+}
+
+/* Headers as name/value rows rather than a flat dump: names align, long
+   values wrap under their own column instead of pushing the layout. */
+.fd-headers { font-size: 11px; font-family: monospace; }
+.fd-hrow {
+  display: grid; grid-template-columns: minmax(80px, 30%) 1fr; gap: 4px 10px;
+  padding: 2px 8px;
+}
+/* Zebra striping via a theme-aware overlay: a white wash is invisible on
+   light mode's background, so light mode darkens instead. Not --row-even,
+   which is tuned against the traffic table's background rather than this
+   box's (and in light mode is lighter than it, striping the wrong way). */
+.fd-hrow:nth-child(even) { background: var(--fd-stripe); }
+.fd-hname { color: var(--accent); word-break: break-word; }
+.fd-hval { color: var(--text); word-break: break-word; }
+.fd-empty-note { padding: 6px 8px; color: var(--text-dim); font-size: 11px; }
 .row-clickable { cursor: pointer; }
 .row-clickable:hover { background: rgba(255,255,255,0.05); }
 

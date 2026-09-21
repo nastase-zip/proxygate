@@ -21,6 +21,7 @@ from flask import Flask, jsonify, request, send_from_directory, Response
 
 from backend import db
 from backend import rules as rules_mod
+from backend import patterns as patterns_mod
 from backend import services
 from backend.services import GatewayState
 
@@ -181,20 +182,6 @@ def get_settings():
     return _ok({"config": cfg, "interfaces": ifaces})
 
 
-@app.route("/api/settings/mediastreamer_dns", methods=["GET"])
-def get_mediastreamer_dns():
-    return _ok(services.mediastreamer_dns_status())
-
-
-@app.route("/api/settings/mediastreamer_dns", methods=["POST"])
-def set_mediastreamer_dns():
-    _log_request()
-    body = request.get_json(force=True, silent=True) or {}
-    enable = bool(body.get("enabled"))
-    ok, msg = services.set_mediastreamer_dns(enable)
-    return _ok(msg=msg) if ok else _err(msg, 500)
-
-
 @app.route("/api/settings", methods=["POST"])
 def save_settings():
     _log_request()
@@ -249,6 +236,13 @@ def add_rule():
     enabled = bool(body.get("enabled", True))
     if not name or not pattern:
         return _err("Name and pattern are required.")
+    # Reject a malformed regex now, while the user is still looking at the
+    # dialog — an invalid pattern otherwise saves fine and then silently
+    # never matches anything, which is near-impossible to debug later.
+    for _p in patterns_mod.split_patterns(pattern):
+        _bad = patterns_mod.validate(_p)
+        if _bad:
+            return _err(_bad)
     data = rules_mod.load_rules()
     data = rules_mod.add_rule(data, name, pattern, proxy, enabled)
     ok, msg = rules_mod.reload_rules(data)
@@ -265,6 +259,13 @@ def update_rule(index: int):
     enabled = bool(body.get("enabled", True))
     if not name or not pattern:
         return _err("Name and pattern are required.")
+    # Reject a malformed regex now, while the user is still looking at the
+    # dialog — an invalid pattern otherwise saves fine and then silently
+    # never matches anything, which is near-impossible to debug later.
+    for _p in patterns_mod.split_patterns(pattern):
+        _bad = patterns_mod.validate(_p)
+        if _bad:
+            return _err(_bad)
     data = rules_mod.load_rules()
     data = rules_mod.update_rule(data, index, name, pattern, proxy, enabled)
     ok, msg = rules_mod.reload_rules(data)
@@ -655,8 +656,14 @@ def ca_cert():
 #                            top of the table asking for more/older rows.
 #                            Filtering (`q`) happens here, in SQL, not in JS.
 
-_HISTORY_CHUNK = 50
-_HISTORY_CHUNK_MAX = 200
+_HISTORY_CHUNK = 2000
+# The UI loads the whole session's history in one request rather than paging
+# it in as you scroll. Paging meant the scroll height grew every time you
+# neared the top, so the scrollbar thumb jumped and the top kept receding —
+# you had to drag up repeatedly to actually reach it. Rows are capped per
+# session anyway (the table is cleared on restart), and a few thousand rows
+# of plain text is nothing for a browser to hold.
+_HISTORY_CHUNK_MAX = 20000
 
 
 @app.route("/api/traffic/session")

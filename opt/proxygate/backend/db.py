@@ -12,7 +12,12 @@ import os
 import sqlite3
 from typing import Optional
 
-DB_PATH = os.getenv("PROXYGATE_DB", "/var/lib/proxygate/traffic.db")
+# Self-contained under this checkout by default — see services.py's
+# PROJECT_ROOT comment.
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+
+DB_PATH = os.getenv("PROXYGATE_DB", os.path.join(_PROJECT_ROOT, "var/lib/proxygate/traffic.db"))
 
 
 def _conn() -> sqlite3.Connection:
@@ -23,9 +28,18 @@ def _conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     """Create tables if they don't exist (safe to call on startup)."""
+    from backend.rules import _restore_owner
+    db_existed = os.path.exists(DB_PATH)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    _restore_owner(os.path.dirname(DB_PATH), is_dir=True)
     conn = _conn()
     with conn:
+        # MUST stay in sync with mitm_logger._init_db(): whichever process
+        # starts first creates the DB. This one previously omitted `protocol`
+        # and `flow_details` entirely, so if the web UI won that race on a
+        # fresh install, every query here referenced a column that didn't
+        # exist — and the resulting OperationalError is swallowed, showing an
+        # empty traffic table rather than an error.
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS connections (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,7 +51,8 @@ def init_db() -> None:
                 status_code       INTEGER,
                 bytes_transferred INTEGER,
                 rule_matched      TEXT,
-                proxy_used        TEXT
+                proxy_used        TEXT,
+                protocol          TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_connections_ts
                 ON connections(timestamp);
@@ -47,8 +62,26 @@ def init_db() -> None:
                 hostname  TEXT NOT NULL,
                 seen_at   TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS flow_details (
+                connection_id     INTEGER PRIMARY KEY REFERENCES connections(id),
+                request_headers   TEXT,
+                request_body      BLOB,
+                request_truncated INTEGER NOT NULL DEFAULT 0,
+                response_headers  TEXT,
+                response_body     BLOB,
+                response_truncated INTEGER NOT NULL DEFAULT 0
+            );
         """)
+        # Older DBs created before `protocol` existed — add it in place so
+        # upgrading doesn't require deleting traffic.db. Mirrors the same
+        # migration in mitm_logger._init_db().
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(connections)")]
+        if "protocol" not in cols:
+            conn.execute("ALTER TABLE connections ADD COLUMN protocol TEXT")
     conn.close()
+    if not db_existed:
+        _restore_owner(DB_PATH)
 
 
 def get_connections_since(last_id: int, limit: int = 200) -> list[dict]:

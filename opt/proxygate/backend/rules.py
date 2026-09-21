@@ -13,6 +13,7 @@ Routing model:
 
 from __future__ import annotations
 
+import copy
 import os
 import tempfile
 import uuid
@@ -20,16 +21,59 @@ from typing import Optional
 
 import yaml
 
-RULES_PATH   = os.getenv("PROXYGATE_RULES",   "/etc/proxygate/rules.yaml")
-CONFIG_PATH  = os.getenv("PROXYGATE_CONFIG",  "/etc/proxygate/config.yaml")
-DEVICES_PATH = os.getenv("PROXYGATE_DEVICES", "/etc/proxygate/devices.yaml")
-BLOCKED_DEVICES_PATH = os.getenv("PROXYGATE_BLOCKED_DEVICES", "/etc/proxygate/blocked_devices.yaml")
+# Everything lives under this checkout by default — see services.py's
+# PROJECT_ROOT comment for why (self-contained, no cross-machine state leaks).
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+
+RULES_PATH   = os.getenv("PROXYGATE_RULES",   os.path.join(PROJECT_ROOT, "etc/proxygate/rules.yaml"))
+CONFIG_PATH  = os.getenv("PROXYGATE_CONFIG",  os.path.join(PROJECT_ROOT, "etc/proxygate/config.yaml"))
+DEVICES_PATH = os.getenv("PROXYGATE_DEVICES", os.path.join(PROJECT_ROOT, "etc/proxygate/devices.yaml"))
+BLOCKED_DEVICES_PATH = os.getenv("PROXYGATE_BLOCKED_DEVICES", os.path.join(PROJECT_ROOT, "etc/proxygate/blocked_devices.yaml"))
+
+
+def _restore_owner(path: str, *, is_dir: bool = False) -> None:
+    """
+    ProxyGate always runs as root (needed for iptables/hostapd/NM), so every
+    file or directory it creates under this checkout would otherwise end up
+    root-owned — locking the invoking user out of their own project
+    directory and forcing a manual chown after every single write. Since
+    everything now lives inside the repo (see PROJECT_ROOT above) instead of
+    a real system /etc, that's not acceptable: hand ownership straight back
+    to whoever ran `sudo proxygate` (SUDO_UID/GID, set by sudo itself) and
+    use a normal user-writable mode instead of mkstemp's default 0600 (or
+    os.makedirs' root-only-effective 0700 once combined with root's umask).
+    Best-effort — SUDO_UID may be unset (e.g. run directly as root without
+    sudo), in which case there's no invoking user to restore and we leave
+    root ownership as the only sane fallback.
+    """
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if uid is not None and gid is not None:
+        try:
+            os.chown(path, int(uid), int(gid))
+        except OSError:
+            pass
+    try:
+        os.chmod(path, 0o755 if is_dir else 0o644)
+    except OSError:
+        pass
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
+# NOTE: loaders must deepcopy these — the nested lists would otherwise be
+# shared with every caller, so mutating a loaded config would rewrite the
+# defaults for the lifetime of the process.
 _DEFAULT_RULES: dict = {
-    "proxies": [],
-    "rules":   [],
+    "proxies": [
+        {"name": "XVPN",   "type": "http", "host": "127.0.0.1", "port": 8893},
+        {"name": "CGVPN",  "type": "http", "host": "127.0.0.1", "port": 8894},
+        {"name": "PIAVPN", "type": "http", "host": "127.0.0.1", "port": 8895},
+    ],
+    "rules": [
+        {"name": "IP Info", "pattern": "*.ipinfo.io", "proxy": "XVPN", "enabled": True},
+        {"name": "Google",  "pattern": "google.com",  "proxy": "XVPN", "enabled": True},
+    ],
     "default": "DIRECT",
 }
 
@@ -47,8 +91,15 @@ def _effective_target(data: dict) -> str:
 
 # ── Load / Save ───────────────────────────────────────────────────────────────
 
-def _ensure_ids(data: dict) -> dict:
-    """Backfill missing ids on existing rules and proxies."""
+def _ensure_ids(data: dict, *, persist: bool = True) -> dict:
+    """
+    Backfill missing ids on existing rules and proxies.
+
+    persist=False skips writing the result back — used on the fallback paths
+    in load_rules(), where the on-disk file is either about to be written by
+    the caller or must not be overwritten at all (a transient read error
+    shouldn't replace a real config with defaults).
+    """
     dirty = False
     for r in data.get("rules", []):
         if not r.get("id"):
@@ -58,22 +109,29 @@ def _ensure_ids(data: dict) -> dict:
         if not p.get("id"):
             p["id"] = str(uuid.uuid4())
             dirty = True
-    if dirty:
+    if dirty and persist:
         save_rules(data)
     return data
 
 
 def load_rules() -> dict:
+    # Every return path goes through _ensure_ids: the seeded defaults carry
+    # no ids of their own, so returning them raw handed callers rules that
+    # only grew an "id" on the NEXT load.
     if not os.path.exists(RULES_PATH):
-        save_rules(_DEFAULT_RULES)
-        return dict(_DEFAULT_RULES)
+        data = _ensure_ids(copy.deepcopy(_DEFAULT_RULES), persist=False)
+        save_rules(data)
+        return data
     try:
         with open(RULES_PATH) as f:
             data = yaml.safe_load(f) or {}
-        data = {**_DEFAULT_RULES, **data}
+        data = {**copy.deepcopy(_DEFAULT_RULES), **data}
         return _ensure_ids(data)
     except Exception:
-        return dict(_DEFAULT_RULES)
+        # Deliberately not saved: a transient read error (or a file being
+        # rewritten concurrently) must not clobber the user's real config
+        # with defaults.
+        return _ensure_ids(copy.deepcopy(_DEFAULT_RULES), persist=False)
 
 
 def save_rules(data: dict) -> None:
@@ -83,6 +141,7 @@ def save_rules(data: dict) -> None:
         with os.fdopen(tmp_fd, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
         os.replace(tmp_path, RULES_PATH)
+        _restore_owner(RULES_PATH)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -226,14 +285,14 @@ _DEFAULT_DEVICES: dict = {"devices": []}
 
 def load_devices() -> dict:
     if not os.path.exists(DEVICES_PATH):
-        save_devices(_DEFAULT_DEVICES)
-        return dict(_DEFAULT_DEVICES)
+        save_devices(copy.deepcopy(_DEFAULT_DEVICES))
+        return copy.deepcopy(_DEFAULT_DEVICES)
     try:
         with open(DEVICES_PATH) as f:
             data = yaml.safe_load(f) or {}
-        return {**_DEFAULT_DEVICES, **data}
+        return {**copy.deepcopy(_DEFAULT_DEVICES), **data}
     except Exception:
-        return dict(_DEFAULT_DEVICES)
+        return copy.deepcopy(_DEFAULT_DEVICES)
 
 
 def save_devices(data: dict) -> None:
@@ -243,6 +302,7 @@ def save_devices(data: dict) -> None:
         with os.fdopen(tmp_fd, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
         os.replace(tmp_path, DEVICES_PATH)
+        _restore_owner(DEVICES_PATH)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -307,14 +367,14 @@ _DEFAULT_BLOCKED_DEVICES: dict = {"devices": []}
 
 def load_blocked_devices() -> dict:
     if not os.path.exists(BLOCKED_DEVICES_PATH):
-        save_blocked_devices(_DEFAULT_BLOCKED_DEVICES)
-        return dict(_DEFAULT_BLOCKED_DEVICES)
+        save_blocked_devices(copy.deepcopy(_DEFAULT_BLOCKED_DEVICES))
+        return copy.deepcopy(_DEFAULT_BLOCKED_DEVICES)
     try:
         with open(BLOCKED_DEVICES_PATH) as f:
             data = yaml.safe_load(f) or {}
-        return {**_DEFAULT_BLOCKED_DEVICES, **data}
+        return {**copy.deepcopy(_DEFAULT_BLOCKED_DEVICES), **data}
     except Exception:
-        return dict(_DEFAULT_BLOCKED_DEVICES)
+        return copy.deepcopy(_DEFAULT_BLOCKED_DEVICES)
 
 
 def save_blocked_devices(data: dict) -> None:
@@ -324,6 +384,7 @@ def save_blocked_devices(data: dict) -> None:
         with os.fdopen(tmp_fd, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
         os.replace(tmp_path, BLOCKED_DEVICES_PATH)
+        _restore_owner(BLOCKED_DEVICES_PATH)
     except Exception:
         try:
             os.unlink(tmp_path)

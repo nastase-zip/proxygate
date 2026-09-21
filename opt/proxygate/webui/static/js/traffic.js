@@ -1,37 +1,38 @@
 /**
- * traffic.js — Live traffic feed, session-scoped and chunk-paginated.
+ * traffic.js — Live traffic feed, scoped to the current server session.
  *
- * Two independent flows, both scoped to the current server session
- * (rows logged before this `sudo proxygate` process started are never
- * loaded automatically — that was the whole point of the rework: don't
- * dump the entire lifetime history into the browser on every startup):
+ * Rows logged before this `sudo proxygate` process started are never loaded:
+ * the table begins empty on each restart rather than dumping the entire
+ * lifetime history into the browser.
  *
- *   1. Live tail — poll /api/traffic/live?since=<last id> every 500ms,
- *      append new rows at the bottom. Small, bounded, cheap.
+ *   1. History — fetched once at startup, in full (see loadHistory). This
+ *      deliberately replaced scroll-up pagination, which grew the content
+ *      every time you neared the top and made the scrollbar impossible to
+ *      drag to the actual top.
  *
- *   2. History — the table's initial content and anything above it. Loaded
- *      in chunks of CHUNK_SIZE via /api/traffic/history?before_id=<cursor>.
- *      The browser never holds more than what's been explicitly paged in:
- *      scrolling near the top of the table asks the server for the next
- *      older chunk and prepends it, preserving scroll offset so the view
- *      doesn't jump. Search (`q`) is sent to the server and re-runs the
- *      whole paging sequence from scratch — no client-side filtering of
- *      rows already in the DOM, per the "search on the host" requirement.
+ *   2. Live tail — poll /api/traffic/live?since=<last id> every 500ms and
+ *      append new rows at the bottom, never touching scrollTop. The thumb
+ *      shrinks as content grows but stays where the user put it; following
+ *      the newest rows is opt-in via the Focus button.
+ *
+ * Search (`q`) is sent to the server and reloads the table from scratch —
+ * no client-side filtering of rows already in the DOM, per the "search on
+ * the host" requirement.
  */
 
 (function () {
   "use strict";
 
   const TAG = "traffic";
-  const CHUNK_SIZE = 50;
   const LIVE_POLL_MS = 500;
-  const SCROLL_LOAD_THRESHOLD_PX = 80; // load next chunk when this close to the top
+  // Upper bound on the session history fetched at startup. Not a page size —
+  // there is no paging; see loadHistory for why.
+  const HISTORY_LIMIT = 20000;
 
   let sessionFloorId = 0;
   let liveSinceId = 0;       // cursor for the forward/live poll
-  let oldestLoadedId = null; // cursor for the backward/history page (null = none loaded yet)
+  let oldestLoadedId = null; // oldest row currently rendered
   let newestLoadedId = null;
-  let hasMoreHistory = true;
   let loadingHistory = false;
   let filter = "";
   let focus = false;
@@ -42,11 +43,14 @@
   // preference (see settings.js), not a server-side filter: the rows are
   // still logged and still counted in /api/traffic stats either way, this
   // just controls whether the traffic table shows them.
-  let showQuic = true;
+  // Off by default: blocked-QUIC rows are high-volume noise for most
+  // sessions, so they're opt-in from Settings. Must match settings.js's
+  // getShowQuic() default, or the toggle would read "off" while rows
+  // still rendered.
+  let showQuic = false;
   try {
-    const stored = localStorage.getItem("proxygate_show_quic");
-    showQuic = stored === null ? true : stored === "1";
-  } catch (e) { /* ignore, default stays true */ }
+    showQuic = localStorage.getItem("proxygate_show_quic") === "1";
+  } catch (e) { /* ignore, default stays false */ }
 
   function shouldRenderRow(row) {
     return showQuic || row.protocol !== "QUIC (blocked)";
@@ -114,7 +118,7 @@
   function updateStats(stats) {
     if (!stats) return;
     document.getElementById("traffic-count").textContent = `Connections: ${stats.total_count}`;
-    document.getElementById("traffic-bytes").textContent = ` | Bytes: ${fmtBytes(stats.total_bytes)}`;
+    document.getElementById("traffic-bytes").textContent = `  |  Bytes: ${fmtBytes(stats.total_bytes)}`;
   }
 
   // ── Initial load / search reset ─────────────────────────────────────────────
@@ -125,7 +129,6 @@
     rowCount = 0;
     oldestLoadedId = null;
     newestLoadedId = null;
-    hasMoreHistory = true;
 
     try {
       const sessRes = await PG.api.get("/api/traffic/session");
@@ -137,70 +140,56 @@
       PG.log.error(TAG, "Failed to load session info", { error: e.message });
     }
 
-    await loadOlderChunk();
+    await loadHistory();
   }
 
-  // ── Backward paging (scroll-up) ─────────────────────────────────────────────
+  // ── History ─────────────────────────────────────────────────────────────────
 
-  async function loadOlderChunk() {
-    if (loadingHistory || !hasMoreHistory) return;
+  // The whole session's history in one request, rather than paging it in as
+  // the user scrolls up.
+  //
+  // Paging was what made the scrollbar unusable: every time you neared the
+  // top it inserted another 50 rows and corrected scrollTop to keep your
+  // visual position, so the content got taller, the thumb jumped back down
+  // and the top receded. Reaching the actual top took several drags. Loading
+  // once means the scroll height is fixed except when live rows arrive, so
+  // dragging up goes up and dragging down goes down.
+  //
+  // Session rows are bounded (the view starts empty on each restart) and a
+  // few thousand rows of plain text costs a browser nothing — especially
+  // with content-visibility skipping layout for off-screen rows.
+  async function loadHistory() {
+    if (loadingHistory) return;
     loadingHistory = true;
-    const wrap = document.querySelector("#panel-traffic .table-wrap");
-    const prevScrollHeight = wrap.scrollHeight;
-    const prevScrollTop = wrap.scrollTop;
-
     try {
-      const params = new URLSearchParams({ limit: String(CHUNK_SIZE) });
-      if (oldestLoadedId != null) params.set("before_id", String(oldestLoadedId));
+      const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
       if (filter) params.set("q", filter);
 
       const res = await PG.api.get(`/api/traffic/history?${params.toString()}`);
       const rows = res.rows || [];
-      hasMoreHistory = res.has_more;
 
-      PG.log.info(TAG, "History chunk loaded", {
-        count: rows.length, before_id: oldestLoadedId, filter, has_more: hasMoreHistory,
-      });
+      PG.log.info(TAG, "History loaded", { count: rows.length, filter, has_more: res.has_more });
 
       if (rows.length) {
-        // Server returns newest-first; insert oldest-to-newest at the top
-        // so the table stays chronological (oldest at top, newest at bottom).
+        // Server returns newest-first; append oldest-to-newest so the table
+        // reads chronologically, oldest at top.
         const tbody = document.getElementById("traffic-tbody");
         const frag = document.createDocumentFragment();
         for (let i = rows.length - 1; i >= 0; i--) {
-          // Cursor tracking below stays based on the full server-returned
-          // set regardless of this filter — only the DOM append is skipped,
-          // so pagination cursors never drift out of sync with what the
-          // server actually has.
           if (shouldRenderRow(rows[i])) {
             frag.appendChild(buildRowEl(rows[i]));
             rowCount++;
           }
         }
-        tbody.insertBefore(frag, tbody.firstChild);
+        tbody.appendChild(frag);
 
         oldestLoadedId = rows[rows.length - 1].id;
-        if (newestLoadedId === null) newestLoadedId = rows[0].id;
-
-        // Preserve visual scroll position: the content we just prepended
-        // pushed everything down by (newScrollHeight - prevScrollHeight).
-        // Without this the browser keeps scrollTop fixed and the view
-        // jumps to show the new rows instead of staying where the user was.
-        requestAnimationFrame(() => {
-          const delta = wrap.scrollHeight - prevScrollHeight;
-          wrap.scrollTop = prevScrollTop + delta;
-        });
+        newestLoadedId = rows[0].id;
       }
     } catch (e) {
-      PG.log.error(TAG, "Failed to load history chunk", { error: e.message, before_id: oldestLoadedId });
+      PG.log.error(TAG, "Failed to load history", { error: e.message });
     } finally {
       loadingHistory = false;
-    }
-  }
-
-  function onScroll(e) {
-    if (e.target.scrollTop <= SCROLL_LOAD_THRESHOLD_PX) {
-      loadOlderChunk();
     }
   }
 
@@ -250,12 +239,22 @@
       matched++;
     }
     if (matched) {
+      // Appending at the bottom only ever grows the content below the
+      // viewport: scrollTop is untouched, so the thumb keeps its position
+      // and simply gets shorter. Nothing is trimmed and nothing is
+      // corrected, which is what makes dragging predictable.
       tbody.appendChild(frag);
-      if (focus) {
-        const wrap = document.querySelector("#panel-traffic .table-wrap");
-        wrap.scrollTop = wrap.scrollHeight;
-      }
+      // Following the newest rows is opt-in via the Focus button. With it
+      // off, appending must never move the scroll position — otherwise it
+      // fights you every time you try to drag up through the history.
+      if (focus) scrollToBottom();
     }
+  }
+
+  function scrollToBottom() {
+    const el = document.querySelector("#panel-traffic .table-scroll");
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight + 1e6, behavior: "instant" });
   }
 
   // ── UI actions ───────────────────────────────────────────────────────────────
@@ -279,7 +278,6 @@
     rowCount = 0;
     oldestLoadedId = null;
     newestLoadedId = liveSinceId;
-    hasMoreHistory = false; // user explicitly cleared; don't silently repopulate from scroll
     updateStats({ total_count: 0, total_bytes: 0 });
   }
 
@@ -289,10 +287,7 @@
     btn.textContent = focus ? "Focus ●" : "Focus";
     btn.classList.toggle("active", focus);
     PG.log.info(TAG, "Focus toggled", { focus });
-    if (focus) {
-      const wrap = document.querySelector("#panel-traffic .table-wrap");
-      wrap.scrollTop = wrap.scrollHeight;
-    }
+    if (focus) scrollToBottom();
   }
 
   function onExport() {
@@ -318,7 +313,6 @@
     document.getElementById("traffic-clear-btn").addEventListener("click", onClear);
     document.getElementById("traffic-export-btn").addEventListener("click", onExport);
     document.getElementById("traffic-focus-btn").addEventListener("click", onFocusToggle);
-    document.querySelector("#panel-traffic .table-wrap").addEventListener("scroll", onScroll);
 
     resetAndLoadNewest();
     setTimeout(pollLive, LIVE_POLL_MS);
@@ -340,5 +334,5 @@
     PG.log.info(TAG, "Show-QUIC preference changed", { show });
   }
 
-  window.PG.traffic = { pollLive, loadOlderChunk, setShowQuic };
+  window.PG.traffic = { pollLive, setShowQuic };
 })();

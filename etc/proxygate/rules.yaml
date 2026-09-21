@@ -1,34 +1,28 @@
-# ProxyGate routing rules
-# Rules are evaluated top-to-bottom; first match wins.
-# Patterns support glob syntax: *.example.com, example.com, 10.0.*
-# proxy: must match a name in the proxies list, or be "DIRECT"
-
+default: XVPN
 proxies:
-  - name: ExpressVPN
-    type: http
-    host: 127.0.0.1
-    port: 8893
-
-  - name: MySOCKS
-    type: socks5
-    host: 1.2.3.4
-    port: 1080
-
+- host: 127.0.0.1
+  id: 4c395b72-656f-4c17-969e-24a1acf10ead
+  name: XVPN
+  port: 8893
+  type: http
+- host: 127.0.0.1
+  id: 026b9b31-4cdc-45bb-8153-2a9b1109147f
+  name: CGVPN
+  port: 8894
+  type: http
+- host: 127.0.0.1
+  id: f604b8a7-fbc0-4810-83f7-41629d450670
+  name: PIAVPN
+  port: 8895
+  type: http
 rules:
-  - name: Google Services
-    pattern: "*.google.com"
-    proxy: ExpressVPN
-    enabled: true
-
-  - name: Cloudflare Direct
-    pattern: "*.cloudflare.com"
-    proxy: DIRECT
-    enabled: true
-
-  - name: Custom SOCKS route
-    pattern: "*.example-internal.net"
-    proxy: MySOCKS
-    enabled: false
-
-# Traffic not matched by any rule uses this proxy
-default: ExpressVPN
+- enabled: true
+  id: b88af286-3151-4add-806a-433ca4ccc032
+  name: Google
+  pattern: google.com
+  proxy: XVPN
+- enabled: true
+  id: 445e9ab8-c2af-45ec-ae10-a86f2354df63
+  name: IP Info
+  pattern: '*.ipinfo.io'
+  proxy: XVPN

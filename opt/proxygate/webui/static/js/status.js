@@ -34,10 +34,27 @@
 
   let lastState = null;
 
+  let statusLineFadeTimer = null;
+
   function setStatusLine(msg, isError) {
     const el = document.getElementById("sp-status-line");
+    clearTimeout(statusLineFadeTimer);
     el.textContent = msg || "";
     el.className = "status-line" + (isError ? " error" : msg ? " ok" : "");
+
+    // Success messages are transient acknowledgements ("iPhone can reconnect
+    // again") — without this they stayed in the topbar forever, since the
+    // only other clear happens when the gateway goes idle. Errors persist,
+    // because those are worth reading after the fact.
+    if (msg && !isError) {
+      statusLineFadeTimer = setTimeout(() => {
+        el.classList.add("fading");
+        statusLineFadeTimer = setTimeout(() => {
+          el.textContent = "";
+          el.className = "status-line";
+        }, 400);
+      }, 4000);
+    }
   }
 
   function applyGatewayUi(state, detail) {
@@ -76,28 +93,15 @@
     }
   }
 
-  // Short labels used for the plain-text top-bar warning line ("AP down,
-  // Mediastreamer down") — deliberately shorter than the dropdown's labels
-  // (e.g. "AP" not "WiFi AP") to keep that line compact.
-  const SERVICE_WARN_LABELS = { hostapd: "AP", dnsmasq: "DNS", mitmproxy: "mitmproxy", mediastreamer: "Mediastreamer" };
-
   function renderServices(services) {
     const list = document.getElementById("services-list");
     list.innerHTML = "";
-    const labels = { hostapd: "WiFi AP", dnsmasq: "dnsmasq", mitmproxy: "mitmproxy", mediastreamer: "Mediastreamer DNS" };
-    const downLabels = [];
-    for (const svc of ["hostapd", "dnsmasq", "mitmproxy", "mediastreamer"]) {
+    const labels = { hostapd: "WiFi AP", dnsmasq: "dnsmasq", mitmproxy: "mitmproxy" };
+    for (const svc of ["hostapd", "dnsmasq", "mitmproxy"]) {
       const status = services[svc] || "unknown";
       const row = document.createElement("div");
       row.className = "svc-row";
-      // "stopped" means "off" (not an error) for the optional mediastreamer
-      // toggle, same dim treatment as the gateway's own idle dot — only its
-      // degraded ("unknown" = enabled but neither resolver reachable) state
-      // is a real warning. The other three services' "stopped" always means
-      // an actual outage of something that's supposed to be running.
-      const dotClass = svc === "mediastreamer"
-        ? (status === "running" ? "ok" : status === "unknown" ? "warn" : "dim")
-        : (status === "running" ? "ok" : status === "stopped" ? "error" : "warn");
+      const dotClass = status === "running" ? "ok" : status === "stopped" ? "error" : "warn";
       const dot = document.createElement("span");
       dot.className = "dot " + dotClass;
       const name = document.createElement("span");
@@ -109,22 +113,23 @@
       row.appendChild(dot);
       row.appendChild(name);
       row.appendChild(stat);
+      // Restart lives on the service's own row rather than as a button in
+      // the topbar — it only ever acted on mitmproxy, so this is where it
+      // belongs. The list is re-rendered on every poll, so the listener is
+      // attached per row instead of once in init().
+      if (svc === "mitmproxy") {
+        const restart = document.createElement("button");
+        restart.className = "icon-btn svc-action";
+        restart.title = "Restart mitmproxy";
+        restart.setAttribute("aria-label", "Restart mitmproxy");
+        restart.innerHTML = '<i class="fa-solid fa-rotate"></i>';
+        restart.addEventListener("click", (e) => {
+          e.stopPropagation();
+          restartMitm();
+        });
+        row.appendChild(restart);
+      }
       list.appendChild(row);
-      const isDown = svc === "mediastreamer" ? status === "unknown" : status === "stopped";
-      if (isDown) downLabels.push(SERVICE_WARN_LABELS[svc] || svc);
-    }
-    renderServiceWarning(downLabels);
-  }
-
-  function renderServiceWarning(downLabels) {
-    const el = document.getElementById("service-warning-line");
-    if (!el) return;
-    if (downLabels.length === 0) {
-      el.classList.add("hidden");
-      el.textContent = "";
-    } else {
-      el.textContent = downLabels.map((l) => `${l} down`).join(", ");
-      el.classList.remove("hidden");
     }
   }
 
@@ -164,7 +169,13 @@
 
       const byMac = new Map();
       for (const dev of seen) {
-        byMac.set(dev.mac, { mac: dev.mac, ip: dev.ip, hostname: dev.hostname, blockedEntry: null });
+        byMac.set(dev.mac, {
+          mac: dev.mac, ip: dev.ip, hostname: dev.hostname,
+          // MAC vendor, when the device sent no DHCP hostname. Absent for
+          // randomized MACs, which most phones use on unknown networks.
+          vendor: dev.vendor || null,
+          blockedEntry: null,
+        });
       }
       for (const entry of blockedEntries) {
         const existing = byMac.get(entry.mac);
@@ -194,14 +205,15 @@
         info.className = "device-mini-info";
         const name = document.createElement("span");
         name.className = "device-mini-name";
-        name.textContent = dev.hostname || dev.ip || dev.mac;
+        name.textContent = dev.hostname || dev.vendor || dev.ip || dev.mac;
         const sub = document.createElement("span");
         sub.className = "device-mini-sub";
+        // MAC deliberately omitted — it's noise in this list, and the
+        // add-device picker still shows it where it's actually needed.
         const subParts = [];
         if (dev.ip) subParts.push(dev.ip);
-        subParts.push(dev.mac);
         if (isBlocked && !dev.ip) subParts.push("offline (blocked)");
-        sub.textContent = subParts.join(" — ");
+        sub.textContent = subParts.join(" · ");
         info.appendChild(name);
         info.appendChild(sub);
 
@@ -210,23 +222,23 @@
 
         const toggleBtn = document.createElement("button");
         toggleBtn.className = "device-mini-kick";
+        // fa-wifi-slash is Font Awesome Pro only, and Free has no slashed
+        // wifi glyph at all — so the blocked state uses fa-ban, a single
+        // clean glyph, rather than stacking fa-slash over fa-wifi (which
+        // never lined up properly at this size).
         toggleBtn.innerHTML = isBlocked
-          ? '<i class="fa-solid fa-wifi-slash"></i>'
+          ? '<i class="fa-solid fa-ban"></i>'
           : '<i class="fa-solid fa-wifi"></i>';
         toggleBtn.title = isBlocked
           ? "Blocked — click to allow this device to reconnect"
           : "Click to kick and block this device from the hotspot";
         toggleBtn.addEventListener("click", () => toggleDeviceBlocked(dev, isBlocked));
         actions.appendChild(toggleBtn);
-
-        if (dev.blockedEntry) {
-          const delBtn = document.createElement("button");
-          delBtn.className = "device-mini-kick";
-          delBtn.innerHTML = '<i class="fa-solid fa-trash-can"></i>';
-          delBtn.title = "Remove from the block list entirely";
-          delBtn.addEventListener("click", () => deleteBlockedDevice(dev));
-          actions.appendChild(delBtn);
-        }
+        // No delete button: the wifi toggle already covers block/unblock,
+        // and a permanently-removed entry can't be re-blocked from the UI
+        // once the device drops off the seen list. Stale entries are edited
+        // out of blocked_devices.yaml by hand instead — see
+        // deleteBlockedDevice below, still exposed on PG.status for that.
 
         row.appendChild(info);
         row.appendChild(actions);
@@ -245,7 +257,6 @@
         PG.log.info(TAG, "Device un-blocked", { mac: dev.mac, label });
         setStatusLine(`${label} can reconnect to the hotspot again.`, false);
       } else {
-        if (!confirm(`Kick "${label}" off the hotspot and block it from reconnecting?`)) return;
         await PG.api.post("/api/devices/blocked", { mac: dev.mac, label: dev.hostname || "" });
         PG.log.info(TAG, "Device kicked and blocked", { mac: dev.mac, label });
         setStatusLine(`Kicked ${label} — blocked from reconnecting.`, false);
@@ -257,9 +268,12 @@
     }
   }
 
+  // No longer wired to a button (see renderDeviceList). Kept and exported on
+  // PG.status so the entry can still be removed from the console —
+  // PG.status.deleteBlockedDevice({ mac: "aa:bb:…" }) — without hand-editing
+  // etc/proxygate/blocked_devices.yaml while the app is running.
   async function deleteBlockedDevice(dev) {
     const label = dev.hostname || dev.ip || dev.mac;
-    if (!confirm(`Remove "${label}" from the block list entirely?`)) return;
     try {
       await PG.api.del(`/api/devices/blocked/${encodeURIComponent(dev.mac)}`);
       PG.log.info(TAG, "Blocked-device entry deleted", { mac: dev.mac, label });
@@ -303,7 +317,6 @@
         lastState = res.gateway_state;
       }
       applyGatewayUi(res.gateway_state, res.gateway_detail);
-      if (!mediastreamerBusy) refreshMediastreamerDns(res.gateway_state === "connected");
       renderServices(res.services);
       renderInterfaceConflict(res);
       document.getElementById("hotspot-ip").textContent = res.hotspot_ip || "—";
@@ -314,55 +327,6 @@
       renderDeviceList();
     } catch (e) {
       PG.log.error(TAG, "Status poll failed", { error: e.message });
-    }
-  }
-
-  let mediastreamerBusy = false;
-
-  function renderMediastreamerBtn(enabled, gatewayConnected) {
-    const btn = document.getElementById("mediastreamer-dns-btn");
-    if (!btn || mediastreamerBusy) return;
-    btn.disabled = !gatewayConnected;
-    btn.classList.toggle("active", !!enabled);
-    btn.title = !gatewayConnected
-      ? "Connect the gateway first to use Mediastreamer DNS."
-      : enabled
-        ? "Mediastreamer DNS is active (85.203.37.1 / .2). Click to disable."
-        : "Routes hotspot DNS through 85.203.37.1 / .2, falling back to normal DNS if both are unreachable. Briefly disconnects all hotspot devices while applying.";
-  }
-
-  async function refreshMediastreamerDns(gatewayConnected) {
-    try {
-      const res = await PG.api.get("/api/settings/mediastreamer_dns");
-      renderMediastreamerBtn(res.enabled, gatewayConnected);
-    } catch (e) {
-      PG.log.warn(TAG, "Failed to load Mediastreamer DNS status", { error: e.message });
-    }
-  }
-
-  async function toggleMediastreamerDns() {
-    const btn = document.getElementById("mediastreamer-dns-btn");
-    if (btn.disabled || mediastreamerBusy) return;
-    const enable = !btn.classList.contains("active");
-    mediastreamerBusy = true;
-    btn.disabled = true;
-    setStatusLine(enable ? "Enabling Mediastreamer DNS…" : "Disabling Mediastreamer DNS…", false);
-    try {
-      const res = await PG.api.post("/api/settings/mediastreamer_dns", { enabled: enable });
-      PG.log.info(TAG, "Mediastreamer DNS toggled", { enable, msg: res.msg });
-      setStatusLine(res.msg, false);
-    } catch (e) {
-      PG.log.error(TAG, "Mediastreamer DNS toggle failed", { error: e.message });
-      setStatusLine(e.message, true);
-    } finally {
-      mediastreamerBusy = false;
-      // Re-sync from the server rather than trusting the requested state —
-      // an enable can fail and auto-roll back server-side, or the gateway
-      // itself may have gone down while this was in flight.
-      try {
-        const stateRes = await PG.api.get("/api/gateway/state");
-        await refreshMediastreamerDns(stateRes.state === "connected");
-      } catch (e) { /* next poll() will resync anyway */ }
     }
   }
 
@@ -391,8 +355,6 @@
 
   function init() {
     document.getElementById("gw-toggle-btn").addEventListener("click", onToggle);
-    document.getElementById("restart-mitm-btn").addEventListener("click", restartMitm);
-    document.getElementById("mediastreamer-dns-btn").addEventListener("click", toggleMediastreamerDns);
     initStatusDropdown();
 
     poll();
@@ -402,5 +364,5 @@
   document.addEventListener("DOMContentLoaded", init);
 
   window.PG = window.PG || {};
-  window.PG.status = { setStatusLine, poll };
+  window.PG.status = { setStatusLine, poll, deleteBlockedDevice };
 })();

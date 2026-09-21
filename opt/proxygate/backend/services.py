@@ -13,6 +13,7 @@ host networking is unaffected.
 from __future__ import annotations
 
 import enum
+import ipaddress
 import logging
 import os
 import shutil
@@ -32,17 +33,39 @@ try:
 except ImportError:
     _yaml = None
 
-# Ensure conntrack is installed (needed to flush existing connections on proxy toggle)
+# conntrack is needed to flush existing connections when the proxy target
+# changes; without it a toggle leaves established flows on the old route.
+#
+# Bounded and non-fatal on purpose. This runs at IMPORT time, so an
+# unbounded apt-get would hang every process that imports this module —
+# the web UI, the CLI, a test run — indefinitely on a held dpkg lock or a
+# dead network, with no output explaining why. Installation is setup.sh's
+# job; this is only a convenience fallback.
 if not shutil.which("conntrack"):
-    subprocess.run(["apt-get", "install", "-y", "-q", "conntrack"],
-                   capture_output=True)
+    try:
+        subprocess.run(["apt-get", "install", "-y", "-q", "conntrack"],
+                       capture_output=True, timeout=60)
+    except Exception as _e:   # timeout, apt missing, no permissions, …
+        log.warning("conntrack is not installed and could not be installed "
+                    "automatically (%s) — connection flushing on proxy "
+                    "switch will be skipped. Install it manually: "
+                    "apt-get install conntrack", _e)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
+#
+# Everything ProxyGate reads/writes lives under this checkout by default
+# (<repo>/etc/proxygate, <repo>/var/lib/proxygate, <repo>/var/log/proxygate)
+# instead of the real /etc, /var/lib, /var/log — keeps the whole project
+# self-contained so a fresh clone/copy never picks up another machine's
+# config, rules, or device state. Override any single path with its
+# PROXYGATE_* env var if a real system-wide install is ever needed.
 
-CONFIG_PATH  = os.getenv("PROXYGATE_CONFIG", "/etc/proxygate/config.yaml")
-RULES_PATH   = os.getenv("PROXYGATE_RULES",  "/etc/proxygate/rules.yaml")
+_HERE          = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT   = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 
-_HERE       = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH  = os.getenv("PROXYGATE_CONFIG", os.path.join(PROJECT_ROOT, "etc/proxygate/config.yaml"))
+RULES_PATH   = os.getenv("PROXYGATE_RULES",  os.path.join(PROJECT_ROOT, "etc/proxygate/rules.yaml"))
+
 ADDON_PATH  = os.getenv("PROXYGATE_ADDON", os.path.join(_HERE, "mitm_logger.py"))
 
 
@@ -58,10 +81,38 @@ _DEFAULT_CONFIG: dict = {
     "hotspot_subnet": "192.168.100.0/24",
     "hotspot_gw":     "192.168.100.1",
     "mitm_port":      8080,
-    "mediastreamer_dns": False,
 }
 
-_DEFAULT_RULES_YAML = "proxies: []\nrules: []\ndefault: DIRECT\n"
+_DEFAULT_RULES_YAML = """\
+proxies:
+  - name: XVPN
+    type: http
+    host: 127.0.0.1
+    port: 8893
+
+  - name: CGVPN
+    type: http
+    host: 127.0.0.1
+    port: 8894
+
+  - name: PIAVPN
+    type: http
+    host: 127.0.0.1
+    port: 8895
+
+rules:
+  - name: IP Info
+    pattern: "*.ipinfo.io"
+    proxy: XVPN
+    enabled: true
+
+  - name: Google
+    pattern: "google.com"
+    proxy: XVPN
+    enabled: true
+
+default: DIRECT
+"""
 
 # ── Runtime state — updated after AP comes up ─────────────────────────────────
 
@@ -91,6 +142,8 @@ def save_config(cfg: dict) -> None:
         with os.fdopen(tmp_fd, "w") as f:
             _yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
         os.replace(tmp_path, CONFIG_PATH)
+        from backend.rules import _restore_owner
+        _restore_owner(CONFIG_PATH)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -400,13 +453,31 @@ _DFS_CHANNELS = frozenset(
 )
 
 
-def _non_dfs_bssid_for_ssid(iface: str, ssid: str) -> Optional[str]:
+def _band_of_freq(freq: Optional[float]) -> Optional[str]:
+    """nmcli's band name for a frequency in MHz: "a" (5 GHz) or "bg" (2.4 GHz)."""
+    if not freq:
+        return None
+    return "a" if freq > 4000 else "bg"
+
+
+def _non_dfs_bssid_for_ssid(iface: str, ssid: str,
+                            prefer_band: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """
     Scan for the strongest same-SSID BSS on `iface` that sits on a non-DFS
     channel, so the client link (and therefore the AP, which must share its
     channel) never lands somewhere the AP can't legally/technically start on.
-    Returns None if no non-DFS BSS of that SSID is in range — caller should
-    then fall back to normal (unpinned) association.
+
+    prefer_band ("a"/"bg") is the band configured in Settings. Because the AP
+    and this client link share one radio and therefore one channel, the ONLY
+    way to honour that setting is to pick a BSS on that band here — pinning
+    the AP's band afterwards can't move it. A BSS on the requested band wins
+    over a stronger one on the other band; if the network has nothing on the
+    requested band, the strongest non-DFS BSS is used regardless so the link
+    still comes up.
+
+    Returns (bssid, band_of_that_bssid). bssid is None if no non-DFS BSS of
+    that SSID is in range — caller should then fall back to normal (unpinned)
+    association.
     """
     try:
         subprocess.run(["ip", "link", "set", iface, "up"], capture_output=True, timeout=5)
@@ -414,19 +485,32 @@ def _non_dfs_bssid_for_ssid(iface: str, ssid: str) -> Optional[str]:
         r = subprocess.run(["iw", "dev", iface, "scan", "dump"],
                             capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
-            return None
+            return None, None
 
         def consider(bssid, freq, ssid_seen, signal):
-            nonlocal best_bssid, best_signal
+            nonlocal best_bssid, best_signal, best_band
+            nonlocal pref_bssid, pref_signal
             if not bssid or ssid_seen != ssid:
                 return
-            channel = int(round((freq - 5000) / 5)) if freq and freq > 4000 else None
-            if channel is None or channel in _DFS_CHANNELS:
+            band = _band_of_freq(freq)
+            if band is None:
                 return
+            # DFS only exists in 5 GHz; a 2.4 GHz BSS is always AP-capable.
+            # (This used to compute a channel for 5 GHz only and drop every
+            # 2.4 GHz BSS as "channel is None", which is why a 2.4 GHz
+            # preference could never be satisfied.)
+            if band == "a":
+                channel = int(round((freq - 5000) / 5))
+                if channel in _DFS_CHANNELS:
+                    return
             if best_signal is None or (signal is not None and signal > best_signal):
-                best_bssid, best_signal = bssid, signal
+                best_bssid, best_signal, best_band = bssid, signal, band
+            if prefer_band and band == prefer_band:
+                if pref_signal is None or (signal is not None and signal > pref_signal):
+                    pref_bssid, pref_signal = bssid, signal
 
-        best_bssid = best_signal = None
+        best_bssid = best_signal = best_band = None
+        pref_bssid = pref_signal = None
         cur_bssid = cur_freq = cur_ssid = cur_signal = None
         for line in r.stdout.splitlines():
             line = line.strip()
@@ -444,10 +528,12 @@ def _non_dfs_bssid_for_ssid(iface: str, ssid: str) -> Optional[str]:
                 except (ValueError, IndexError):
                     cur_signal = None
         consider(cur_bssid, cur_freq, cur_ssid, cur_signal)
-        return best_bssid
+        if pref_bssid:
+            return pref_bssid, prefer_band
+        return best_bssid, best_band
     except Exception as e:
         log.warning(f"_non_dfs_bssid_for_ssid: {e}")
-        return None
+        return None, None
 
 
 def detect_current_wifi_network(ap_if: str) -> tuple[str, str]:
@@ -566,10 +652,23 @@ def ensure_ipv6_client_link() -> tuple[bool, str, Optional[str], Optional[int]]:
     subprocess.run(["nmcli", "device", "set", IPV6_CLIENT_IF, "managed", "yes"],
                     capture_output=True, timeout=5)
 
-    non_dfs_bssid = _non_dfs_bssid_for_ssid(IPV6_CLIENT_IF, ssid)
+    # The configured band can only be honoured through the BSS chosen here:
+    # the AP shares this radio and therefore this channel, so whatever band
+    # the client link lands on is the band the AP gets.
+    want_band = (load_config().get("ap_band") or "").strip().lower()
+    if want_band not in ("a", "bg"):
+        want_band = ""
+
+    non_dfs_bssid, got_band = _non_dfs_bssid_for_ssid(
+        IPV6_CLIENT_IF, ssid, prefer_band=want_band or None)
     if non_dfs_bssid:
         log.info(f"ensure_ipv6_client_link: pinning to non-DFS BSS {non_dfs_bssid} for {ssid!r} "
-                  f"(AP mode can't start on a DFS channel on this hardware)")
+                  f"on band={got_band!r} (AP mode can't start on a DFS channel on this hardware)")
+        if want_band and got_band and got_band != want_band:
+            log.warning(
+                f"ensure_ipv6_client_link: configured WiFi band {want_band!r} is not available on "
+                f"{ssid!r} (nothing in range on that band), using {got_band!r} instead — the hotspot "
+                f"shares this radio's channel, so it will also be on {got_band!r}")
     else:
         log.warning(f"ensure_ipv6_client_link: no non-DFS BSS of {ssid!r} in range — "
                      f"letting NM pick; AP activation may fail if it lands on a DFS channel")
@@ -659,289 +758,6 @@ def _phy_for_iface(iface: str) -> Optional[str]:
     return None
 
 
-# ── Mediastreamer DNS ──────────────────────────────────────────────────────────
-#
-# Optional override of the hotspot's upstream DNS resolver, for streaming
-# services that resolve differently (or block) via the WAN's normal DNS path.
-#
-# Mechanism: NM's "shared" mode AP runs its own internal dnsmasq instance
-# (see apply_iptables()'s DNS DNAT rule, which forces all hotspot DNS onto
-# it). That instance is launched with `--conf-dir=/etc/NetworkManager/
-# dnsmasq-shared.d`, which is the only supported injection point for extra
-# dnsmasq options in shared mode — `nmcli ipv4.dns` is rejected outright
-# ("this property is not allowed for 'method=shared'"), confirmed against a
-# live NM 1.54 instance.
-#
-# Fallback chain (.1 -> .2 -> host's normal resolvers) is handled entirely
-# by dnsmasq itself, not by any Python-side health checking:
-#   - NM's shared-mode dnsmasq is already launched with --strict-order, so
-#     multiple `server=` lines are tried strictly in the order listed, only
-#     moving to the next on failure/timeout of the previous one.
-#   - The drop-in deliberately does NOT set `no-resolv`, so if BOTH
-#     85.203.37.1 and .2 are unreachable, dnsmasq still falls through to
-#     whatever it would have used anyway (the host's own /etc/resolv.conf
-#     upstream) — i.e. exactly pre-existing default behaviour. This is the
-#     "last resort fallback to ProxyGate's DNS settings" requirement: there
-#     is nothing to explicitly configure for it, disabling the override IS
-#     the fallback.
-#
-# This only affects hotspot CLIENT DNS resolution (queries hitting the AP's
-# dnsmasq on 192.168.100.1:53). It is independent of:
-#   - rules.yaml's per-hostname upstream proxy routing (ExpressVPN/SOCKS/etc,
-#     handled natively in mitm_logger.py) — that operates on already-resolved
-#     TCP destinations and client SNI/Host headers, never consults this
-#     dnsmasq instance.
-#   - The VPN provider Docker containers (cgvpn/xvpn/piavpn) — they run on
-#     their own bridge network and resolve via Docker's embedded DNS
-#     (127.0.0.11 -> host's systemd-resolved), never touching the hotspot's
-#     dnsmasq or 192.168.100.1 at all. Verified via `docker exec ... cat
-#     /etc/resolv.conf` and `docker inspect`.
-
-MEDIASTREAMER_DNS_SERVERS = ("85.203.37.1", "85.203.37.2")
-_DNSMASQ_SHARED_DIR   = "/etc/NetworkManager/dnsmasq-shared.d"
-_MEDIASTREAMER_CONF   = os.path.join(_DNSMASQ_SHARED_DIR, "proxygate-mediastreamer-dns.conf")
-
-
-def _probe_dns_server(ip: str, timeout: float = 2.0) -> bool:
-    """Best-effort check that `ip` answers UDP/53 at all (TCP connect to the
-    port — cheap, no dependency on a DNS query library, just proves something
-    is listening and reachable before we commit to using it as upstream)."""
-    try:
-        with socket.create_connection((ip, 53), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-_mediastreamer_health_lock = threading.Lock()
-_mediastreamer_last_healthy: Optional[bool] = None  # None = not checked yet
-
-
-def mediastreamer_dns_status() -> dict:
-    """
-    Current state: whether the drop-in exists, plus the last background
-    health probe result (see _mediastreamer_health_watchdog) rather than a
-    live check on every call — this is polled every 5s by the status panel,
-    so probing 85.203.37.1/.2 fresh each time would mean a constant stream
-    of outbound DNS traffic just to paint a status dot.
-    """
-    enabled = os.path.exists(_MEDIASTREAMER_CONF)
-    with _mediastreamer_health_lock:
-        healthy = _mediastreamer_last_healthy
-    return {
-        "enabled": enabled,
-        "servers": list(MEDIASTREAMER_DNS_SERVERS) if enabled else [],
-        # "unknown" right after enabling, before the first background probe
-        # has had a chance to run — treated as healthy by the UI so the dot
-        # doesn't flash red for no reason during that window.
-        "healthy": True if healthy is None else healthy,
-    }
-
-
-def _mediastreamer_health_watchdog() -> None:
-    """
-    Every 30s while Mediastreamer DNS is enabled: re-probe 85.203.37.1/.2 for
-    plain TCP/53 reachability (same cheap check used at enable-time) and
-    cache the result for mediastreamer_dns_status() to report. Exits on its
-    own once the feature is disabled or the gateway disconnects — restarted
-    by set_mediastreamer_dns() on the next enable.
-
-    This does NOT change dnsmasq's config or trigger any restart — actual
-    failover between .1/.2/host-resolvers is handled live, per query, by
-    dnsmasq's own --strict-order server list (see the module docstring
-    above). This watchdog only exists to surface "both are currently
-    unreachable" as a status-panel warning; it never mutates network state.
-    """
-    global _mediastreamer_last_healthy
-    while True:
-        time.sleep(30)
-        if not os.path.exists(_MEDIASTREAMER_CONF):
-            with _mediastreamer_health_lock:
-                _mediastreamer_last_healthy = None
-            return
-        state, _ = get_gateway_state()
-        if state != GatewayState.CONNECTED:
-            with _mediastreamer_health_lock:
-                _mediastreamer_last_healthy = None
-            return
-        healthy = any(_probe_dns_server(ip) for ip in MEDIASTREAMER_DNS_SERVERS)
-        with _mediastreamer_health_lock:
-            _mediastreamer_last_healthy = healthy
-        if not healthy:
-            log.warning(
-                "Mediastreamer DNS: neither %s nor %s reachable — hotspot "
-                "clients are now falling back to normal DNS for new queries "
-                "(dnsmasq handles this automatically; no action taken here).",
-                *MEDIASTREAMER_DNS_SERVERS,
-            )
-
-
-def _start_mediastreamer_health_watchdog() -> None:
-    t = threading.Thread(target=_mediastreamer_health_watchdog, daemon=True,
-                         name="mediastreamer-health-watchdog")
-    t.start()
-
-
-def set_mediastreamer_dns(enable: bool) -> tuple[bool, str]:
-    """
-    Enable or disable the Mediastreamer DNS override for the hotspot.
-
-    On enable: probes 85.203.37.1/.2 for basic TCP/53 reachability first (if
-    NEITHER answers, refuses to enable and leaves existing config untouched —
-    no point swapping to a resolver we already know is dead). Writes the
-    drop-in, then restarts the hotspot's dnsmasq companion process the same
-    way a manual `nmcli con down/up proxygate-ap` would, and does a live
-    resolution check against the new config. If that check fails, automatically
-    rolls back to the previous state (removes the drop-in, restarts again) so
-    a bad change never leaves the hotspot without working DNS.
-
-    On disable: removes the drop-in and restarts, returning to whatever the
-    host's normal upstream resolvers are.
-    """
-    global _mediastreamer_last_healthy
-
-    gw_state, _ = get_gateway_state()
-    if gw_state in (GatewayState.CONNECTING, GatewayState.DISCONNECTING):
-        return False, (
-            "Gateway is currently connecting/disconnecting — try again once "
-            "it settles, to avoid racing the hotspot's own restart."
-        )
-
-    cfg = load_config()
-    was_enabled = os.path.exists(_MEDIASTREAMER_CONF)
-
-    if not enable:
-        try:
-            if was_enabled:
-                os.remove(_MEDIASTREAMER_CONF)
-        except OSError as e:
-            return False, f"Could not remove Mediastreamer DNS config: {e}"
-        ok, msg = _restart_hotspot_dnsmasq()
-        if not ok:
-            return False, f"Disabled, but hotspot restart failed: {msg}"
-        cfg["mediastreamer_dns"] = False
-        save_config(cfg)
-        with _mediastreamer_health_lock:
-            _mediastreamer_last_healthy = None
-        return True, "Mediastreamer DNS disabled — hotspot reverted to normal DNS."
-
-    reachable = [ip for ip in MEDIASTREAMER_DNS_SERVERS if _probe_dns_server(ip)]
-    if not reachable:
-        return False, (
-            f"Neither {MEDIASTREAMER_DNS_SERVERS[0]} nor {MEDIASTREAMER_DNS_SERVERS[1]} "
-            "is reachable on port 53 right now — refusing to enable. Hotspot DNS left unchanged."
-        )
-
-    # Back up whatever was there (there shouldn't be anything, but a prior
-    # partial/failed write is possible) so a failed enable can restore it.
-    backup_path = _MEDIASTREAMER_CONF + ".bak"
-    had_existing = os.path.exists(_MEDIASTREAMER_CONF)
-    try:
-        if had_existing:
-            shutil.copy2(_MEDIASTREAMER_CONF, backup_path)
-
-        os.makedirs(_DNSMASQ_SHARED_DIR, exist_ok=True)
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=_DNSMASQ_SHARED_DIR)
-        with os.fdopen(tmp_fd, "w") as f:
-            f.write("# Managed by ProxyGate — Mediastreamer DNS toggle.\n")
-            for ip in MEDIASTREAMER_DNS_SERVERS:
-                f.write(f"server={ip}\n")
-        os.replace(tmp_path, _MEDIASTREAMER_CONF)
-    except OSError as e:
-        return False, f"Could not write Mediastreamer DNS config: {e}"
-
-    ok, msg = _restart_hotspot_dnsmasq()
-    if not ok:
-        _rollback_mediastreamer_dns(had_existing, backup_path)
-        return False, f"Hotspot restart failed, rolled back: {msg}"
-
-    ok, msg = _verify_hotspot_dns()
-    if not ok:
-        _rollback_mediastreamer_dns(had_existing, backup_path)
-        _restart_hotspot_dnsmasq()  # best-effort — restore working DNS after rollback
-        return False, f"DNS verification failed after enabling, rolled back: {msg}"
-
-    try:
-        if os.path.exists(backup_path):
-            os.remove(backup_path)
-    except OSError:
-        pass
-
-    cfg["mediastreamer_dns"] = True
-    save_config(cfg)
-    with _mediastreamer_health_lock:
-        _mediastreamer_last_healthy = True
-    _start_mediastreamer_health_watchdog()
-    reachable_str = " and ".join(reachable)
-    return True, f"Mediastreamer DNS enabled ({reachable_str} reachable)."
-
-
-def _rollback_mediastreamer_dns(had_existing: bool, backup_path: str) -> None:
-    """Best-effort restore to the pre-enable state: remove our drop-in, or
-    restore the prior file if one existed before we touched it."""
-    try:
-        if had_existing and os.path.exists(backup_path):
-            os.replace(backup_path, _MEDIASTREAMER_CONF)
-        elif os.path.exists(_MEDIASTREAMER_CONF):
-            os.remove(_MEDIASTREAMER_CONF)
-    except OSError:
-        pass
-
-
-def _restart_hotspot_dnsmasq() -> tuple[bool, str]:
-    """
-    Bounce the AP connection so NM tears down and respawns its internal
-    dnsmasq companion process, picking up conf-dir changes.
-
-    NM's shared-mode dnsmasq only re-reads --conf-dir on process start, so
-    there is no live-reload path — this deauthenticates every currently
-    connected hotspot client for a few seconds (confirmed in manual testing:
-    clients reconnect and resume automatically, DHCP leases are unaffected,
-    but the WiFi association itself drops). That cost is paid on BOTH enable
-    and disable, not just on failure, since disable also needs the process
-    to restart to stop using the override. The UI should warn about this
-    before toggling.
-
-    Only meaningful while the hotspot is actually up — if it's down, the
-    config change is still saved to disk and takes effect next time it's
-    started (create_nm_ap_connection()'s recreation doesn't touch
-    dnsmasq-shared.d, so no interaction there).
-    """
-    if _nmcli_ap_status() != "running":
-        return True, "Hotspot is not currently running; config saved for next start."
-    ok_down, msg_down = _nmcli_ap("down")
-    if not ok_down:
-        return False, f"Failed to stop hotspot: {msg_down}"
-    time.sleep(1)
-    ok_up, msg_up = _nmcli_ap("up")
-    if not ok_up:
-        return False, f"Failed to restart hotspot: {msg_up}"
-    return True, "Hotspot restarted."
-
-
-def _verify_hotspot_dns(timeout: float = 3.0, attempts: int = 3) -> tuple[bool, str]:
-    """
-    Confirm the hotspot's own dnsmasq (on hotspot_gw:53) actually answers a
-    real query after a config change — not just that the process exists.
-    Retries briefly since dnsmasq needs a moment to rebind after restart.
-    """
-    gw = load_config()["hotspot_gw"]
-    last_err = "unknown error"
-    for _ in range(attempts):
-        try:
-            result = subprocess.run(
-                ["dig", f"@{gw}", "example.com", "+time=2", "+tries=1", "+short"],
-                capture_output=True, text=True, timeout=timeout,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return True, "DNS resolution confirmed."
-            last_err = (result.stderr or result.stdout or "empty response").strip()
-        except (subprocess.TimeoutExpired, OSError) as e:
-            last_err = str(e)
-        time.sleep(1)
-    return False, f"No answer from {gw}:53 after {attempts} attempts ({last_err})"
-
-
 # ── NM AP connection creation ─────────────────────────────────────────────────
 
 def create_nm_ap_connection(force_band: Optional[str] = None, force_channel: Optional[int] = None) -> tuple[bool, str]:
@@ -967,7 +783,12 @@ def create_nm_ap_connection(force_band: Optional[str] = None, force_channel: Opt
     password = cfg["ap_password"]
     gw       = cfg["hotspot_gw"]
     wifi_if  = cfg.get("ap_wifi_if") or "*"
-    band     = force_band or cfg.get("ap_band", "").strip().lower()
+    want_band = cfg.get("ap_band", "").strip().lower()
+    # force_band/force_channel come from the IPv6 client link, which already
+    # shares this radio — its channel is a hard constraint, so it wins over
+    # the configured band (ensure_ipv6_client_link steers the client link
+    # toward want_band in the first place, and logs when it can't).
+    band = force_band or want_band
 
     subprocess.run(["nmcli", "con", "delete", con_name],
                    capture_output=True, timeout=10)
@@ -991,12 +812,20 @@ def create_nm_ap_connection(force_band: Optional[str] = None, force_channel: Opt
     ]
 
     if force_channel:
-        cmd += ["802-11-wireless.band", band or ("a" if force_channel > 14 else "bg")]
+        # The channel is the authority here: NM rejects the profile if the
+        # band doesn't match the channel, so derive it from the channel
+        # rather than trusting a possibly-stale band string.
+        chan_band = "a" if force_channel > 14 else "bg"
+        cmd += ["802-11-wireless.band", chan_band]
         cmd += ["802-11-wireless.channel", str(force_channel)]
+        log.info(f"create_nm_ap_connection: pinned to band={chan_band} channel={force_channel} "
+                 f"(shared with the IPv6 client link)")
     elif band in ("a", "bg"):
         cmd += ["802-11-wireless.band", band]
         if band == "bg":
             cmd += ["802-11-wireless.channel", "6"]
+        log.info(f"create_nm_ap_connection: band={band} from settings "
+                 f"(no IPv6 client link pinning this radio)")
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
 
@@ -1620,16 +1449,27 @@ def _ensure_rules_yaml() -> None:
     if not os.path.exists(RULES_PATH):
         with open(RULES_PATH, "w") as f:
             f.write(_DEFAULT_RULES_YAML)
+        from backend.rules import _restore_owner
+        _restore_owner(RULES_PATH)
 
 
 
 def _iptables_chain_exists() -> bool:
     """Return True if our NAT chain is still in place (quick health check)."""
-    r = subprocess.run(
-        ["iptables", "-t", "nat", "-L", "PROXYGATE_REDIRECT", "-n"],
-        capture_output=True,
-    )
-    return r.returncode == 0
+    # Bounded and non-raising: this runs on the watchdog's 5s timer, whose
+    # loop has no exception handling of its own — an escaping error would
+    # kill the watchdog thread for the rest of the process's life, silently
+    # ending iptables self-healing. A wedged iptables (xtables lock
+    # contention) is reported as "chain missing", and the next tick retries.
+    try:
+        r = subprocess.run(
+            ["iptables", "-t", "nat", "-L", "PROXYGATE_REDIRECT", "-n"],
+            capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception as e:
+        log.warning(f"iptables chain check failed: {e}")
+        return False
 
 
 def _active_masq_out_if() -> Optional[str]:
@@ -1662,26 +1502,35 @@ def _iptables_watchdog() -> None:
     """
     while True:
         time.sleep(5)
-        state, _ = get_gateway_state()
-        if state != GatewayState.CONNECTED:
-            return
+        # The whole body is guarded: this thread is the only thing that
+        # re-heals iptables, and apply_iptables() raises RuntimeError from
+        # _must() whenever any single command fails. Letting that escape
+        # would end the thread for the lifetime of the process, silently
+        # disabling self-healing — exactly when it's most needed. Log and
+        # retry on the next tick instead.
+        try:
+            state, _ = get_gateway_state()
+            if state != GatewayState.CONNECTED:
+                return
 
-        if not _iptables_chain_exists():
-            log.warning("PROXYGATE_REDIRECT chain missing — reapplying iptables.")
-            apply_iptables()
-            continue
+            if not _iptables_chain_exists():
+                log.warning("PROXYGATE_REDIRECT chain missing — reapplying iptables.")
+                apply_iptables()
+                continue
 
-        cfg = load_config()
-        ap_if = resolve_ap_wifi_if()
-        wan_cfg = (cfg.get("wan_if") or "").strip()
-        expected_wan = wan_cfg if wan_cfg and wan_cfg != ap_if else detect_wan_if()
-        active_wan = _active_masq_out_if()
-        if expected_wan and active_wan and expected_wan != active_wan:
-            log.warning(
-                f"WAN interface changed ({active_wan} -> {expected_wan}) — "
-                f"reapplying iptables so traffic routes out the current one."
-            )
-            apply_iptables()
+            cfg = load_config()
+            ap_if = resolve_ap_wifi_if()
+            wan_cfg = (cfg.get("wan_if") or "").strip()
+            expected_wan = wan_cfg if wan_cfg and wan_cfg != ap_if else detect_wan_if()
+            active_wan = _active_masq_out_if()
+            if expected_wan and active_wan and expected_wan != active_wan:
+                log.warning(
+                    f"WAN interface changed ({active_wan} -> {expected_wan}) — "
+                    f"reapplying iptables so traffic routes out the current one."
+                )
+                apply_iptables()
+        except Exception as e:
+            log.error(f"iptables watchdog tick failed ({e}) — retrying in 5s")
 
 
 def _start_iptables_watchdog() -> None:
@@ -1728,8 +1577,6 @@ def _detect_initial_state() -> None:
         apply_iptables()
         _set_gw(GatewayState.CONNECTED, "Gateway active")
         _start_iptables_watchdog()
-        if os.path.exists(_MEDIASTREAMER_CONF):
-            _start_mediastreamer_health_watchdog()
     else:
         _clear_stale_network_state()
 
@@ -1740,8 +1587,14 @@ def bootstrap() -> None:
     No network changes beyond clearing state proven stale from a previous
     unclean shutdown; connect_gateway() / disconnect_gateway() own everything else.
     """
-    for d in ("/etc/proxygate", "/var/lib/proxygate", "/var/log/proxygate"):
+    from backend.rules import _restore_owner
+    for d in (
+        os.path.join(PROJECT_ROOT, "etc/proxygate"),
+        os.path.join(PROJECT_ROOT, "var/lib/proxygate"),
+        os.path.join(PROJECT_ROOT, "var/log/proxygate"),
+    ):
         os.makedirs(d, exist_ok=True)
+        _restore_owner(d, is_dir=True)
 
     _ensure_rules_yaml()
 
@@ -1758,27 +1611,7 @@ def check_all_services() -> dict[str, str]:
         "hostapd":       service_status("hostapd"),
         "dnsmasq":       service_status("dnsmasq"),
         "mitmproxy":     mitm.status(),
-        "mediastreamer": _mediastreamer_service_status(),
     }
-
-
-def _mediastreamer_service_status() -> str:
-    """
-    Mediastreamer DNS mapped onto the same running/stopped/unknown vocabulary
-    the other three services use, so it drops into the existing status-panel
-    rendering unchanged:
-      - "stopped": feature is off (this is the normal, non-error state when
-        disabled — same meaning as "stopped" for an optional service).
-      - "running": feature is on AND the last background health probe found
-        at least one of 85.203.37.1/.2 reachable.
-      - "unknown": feature is on but the last probe found NEITHER reachable
-        — surfaced as the warning/amber state, not "stopped", since dnsmasq
-        is still configured to use it and may recover on its own.
-    """
-    status = mediastreamer_dns_status()
-    if not status["enabled"]:
-        return "stopped"
-    return "running" if status["healthy"] else "unknown"
 
 
 def get_interface_ip(iface: str) -> str:
@@ -1826,37 +1659,167 @@ def get_connected_devices() -> int:
 # a DHCP lease renewal, so a device flagged once in the UI stays flagged even
 # if its IP changes on the hotspot subnet.
 
+_OUI_PATHS = (
+    "/usr/share/ieee-data/oui.txt",
+    "/var/lib/ieee-data/oui.txt",
+    "/usr/share/misc/oui.txt",
+)
+
+# Parsed lazily on first use and cached — the file is ~6MB, so it's read
+# once per process rather than on every device-list poll.
+_oui_cache: Optional[dict[str, str]] = None
+
+
+def _load_oui() -> dict[str, str]:
+    global _oui_cache
+    if _oui_cache is not None:
+        return _oui_cache
+    table: dict[str, str] = {}
+    for path in _OUI_PATHS:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    # "10-E9-92   (hex)\t\tINGRAM MICRO SERVICES"
+                    if "(hex)" not in line:
+                        continue
+                    prefix, _, vendor = line.partition("(hex)")
+                    prefix = prefix.strip().replace("-", ":").lower()
+                    vendor = vendor.strip()
+                    if len(prefix) == 8 and vendor:
+                        table[prefix] = vendor
+            if table:
+                break
+        except Exception:
+            continue
+    _oui_cache = table
+    return table
+
+
+def _mac_vendor(mac: str) -> Optional[str]:
+    """
+    Vendor name for a MAC's OUI prefix, or None.
+
+    Returns None for locally-administered addresses (the second-least
+    significant bit of the first octet is set) — that's MAC randomization,
+    which phones do by default on unknown networks. Those bytes are random,
+    so any OUI "match" would be meaningless rather than merely missing.
+    """
+    parts = mac.split(":")
+    if len(parts) < 3:
+        return None
+    try:
+        first = int(parts[0], 16)
+    except ValueError:
+        return None
+    if first & 0x02:
+        return None
+    vendor = _load_oui().get(":".join(parts[:3]).lower())
+    if not vendor:
+        return None
+    # The IEEE file shouts every name in caps; title-case the shouty ones
+    # but leave mixed-case entries ("Cyklop Fastjet…") alone.
+    return vendor.title() if vendor.isupper() else vendor
+
+
+def _lease_file_candidates() -> list[str]:
+    """
+    Where the hotspot's DHCP leases might live, best match first.
+
+    NetworkManager's shared-mode dnsmasq writes per-interface to
+    /var/lib/NetworkManager/dnsmasq-<iface>.leases — NOT to
+    /var/lib/misc/dnsmasq.leases, which is a system-wide dnsmasq's default
+    and simply doesn't exist on an NM-managed hotspot. Only the last of
+    these was being read, so leases (and therefore every device hostname)
+    were never found on this setup.
+    """
+    iface = current_hotspot_if()
+    paths = []
+    if iface:
+        paths.append(f"/var/lib/NetworkManager/dnsmasq-{iface}.leases")
+    paths.append("/var/lib/misc/dnsmasq.leases")
+    return paths
+
+
+def _read_leases() -> list[tuple[str, str, Optional[str]]]:
+    """
+    Parse the hotspot's DHCP lease file into (mac, ip, hostname) tuples.
+    dnsmasq writes "*" for a client that sent no hostname; that becomes None.
+    """
+    for path in _lease_file_candidates():
+        rows: list[tuple[str, str, Optional[str]]] = []
+        try:
+            with open(path) as f:
+                for line in f:
+                    parts = line.split()
+                    # format: <expiry> <mac> <ip> <hostname> <client-id>
+                    if len(parts) >= 4:
+                        mac, ip, hostname = parts[1].lower(), parts[2], parts[3]
+                        rows.append((mac, ip, None if hostname == "*" else hostname))
+                    elif len(parts) >= 3:
+                        rows.append((parts[1].lower(), parts[2], None))
+        except Exception:
+            continue
+        if rows:
+            return rows
+    return []
+
+
 def _dnsmasq_leases() -> dict[str, str]:
     """Return {ip: mac} from NM's internal dnsmasq lease file (hotspot's DHCP)."""
-    leases: dict[str, str] = {}
-    try:
-        with open("/var/lib/misc/dnsmasq.leases") as f:
-            for line in f:
-                parts = line.split()
-                # format: <expiry> <mac> <ip> <hostname> <client-id>
-                if len(parts) >= 3:
-                    mac, ip = parts[1].lower(), parts[2]
-                    leases[ip] = mac
-    except Exception:
-        pass
-    return leases
+    return {ip: mac for mac, ip, _ in _read_leases()}
+
+
+def current_hotspot_if() -> str:
+    """
+    The live hotspot interface name, re-resolving it if the cached
+    HOTSPOT_IF is stale.
+
+    HOTSPOT_IF is only assigned when THIS process brings the AP up
+    (_nmcli_ap) or detects it at startup (_detect_initial_state). If the AP
+    was already running and that startup detection didn't land — the web
+    UI restarted on its own, or NM hadn't finished activating yet — the
+    module default "ap0" stays, and every command scoped to `dev ap0`
+    fails with "Cannot find device". That silently emptied the hotspot
+    device list, since the failure is swallowed as an exception.
+    """
+    global HOTSPOT_IF
+    if HOTSPOT_IF and HOTSPOT_IF != "ap0":
+        return HOTSPOT_IF
+    resolved = _get_ap_if()
+    if resolved and resolved != "ap0":
+        HOTSPOT_IF = resolved
+    return HOTSPOT_IF
 
 
 def _neighbor_table() -> dict[str, str]:
-    """Return {ip: mac} from the kernel's IPv4 neighbor (ARP) table, as a
-    fallback for devices dnsmasq hasn't leased directly (e.g. static IP)."""
+    """Return {ip: mac} from the kernel's IPv4 neighbor (ARP) table, scoped to
+    the hotspot interface only — as a fallback for devices dnsmasq hasn't
+    leased directly (e.g. static IP). Unscoped `ip neigh show` dumps every
+    interface's ARP table (host LAN, Docker bridges, etc.), which would leak
+    unrelated neighbors (e.g. a Docker container's gateway) into the hotspot
+    device list."""
     neighbors: dict[str, str] = {}
     try:
         r = subprocess.run(
-            ["ip", "-4", "neigh", "show"],
+            ["ip", "-4", "neigh", "show", "dev", current_hotspot_if()],
             capture_output=True, text=True, timeout=5,
         )
         for line in r.stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 5 and parts[1] == "dev" and "lladdr" in parts:
-                ip = parts[0]
-                mac = parts[parts.index("lladdr") + 1].lower()
-                neighbors[ip] = mac
+            # Scoped to an interface, `ip neigh show dev X` omits the "dev X"
+            # field its unscoped form prints, so the line is just
+            # "<ip> lladdr <mac> <state>". Parse off "lladdr" rather than a
+            # fixed field count, which handles both shapes.
+            if "lladdr" not in parts:
+                continue
+            idx = parts.index("lladdr")
+            if idx + 1 >= len(parts):
+                continue
+            # FAILED/INCOMPLETE entries are stale: the device is gone but the
+            # kernel keeps the row around for a while.
+            if "FAILED" in parts or "INCOMPLETE" in parts:
+                continue
+            neighbors[parts[0]] = parts[idx + 1].lower()
     except Exception:
         pass
     return neighbors
@@ -1879,19 +1842,41 @@ def list_hotspot_devices() -> list[dict]:
     reconnecting). Used by the web UI's device picker for the decrypt
     allowlist — the source of truth for the allowlist itself is
     devices.yaml (backend/rules.py), this is just "what's out there".
+
+    Filtered to the configured hotspot_subnet — /var/lib/misc/dnsmasq.leases
+    can be shared by more than just NM's hotspot dnsmasq instance on some
+    setups, and the neighbor table (see _neighbor_table()) is host-wide by
+    nature, so without this a Docker bridge peer or the host's own LAN
+    gateway can otherwise show up looking like a connected hotspot client.
     """
-    seen: dict[str, dict] = {}
     try:
-        with open("/var/lib/misc/dnsmasq.leases") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 4:
-                    mac, ip, hostname = parts[1].lower(), parts[2], parts[3]
-                    seen[mac] = {"mac": mac, "ip": ip, "hostname": None if hostname == "*" else hostname}
-    except Exception:
-        pass
+        subnet = ipaddress.ip_network(load_config()["hotspot_subnet"], strict=False)
+    except (ValueError, KeyError):
+        subnet = None
+
+    def _in_subnet(ip: str) -> bool:
+        if subnet is None:
+            return True
+        try:
+            return ipaddress.ip_address(ip) in subnet
+        except ValueError:
+            return False
+
+    seen: dict[str, dict] = {}
+    for mac, ip, hostname in _read_leases():
+        if _in_subnet(ip):
+            seen[mac] = {"mac": mac, "ip": ip, "hostname": hostname}
     for ip, mac in _neighbor_table().items():
-        seen.setdefault(mac, {"mac": mac, "ip": ip, "hostname": None})
+        if _in_subnet(ip):
+            seen.setdefault(mac, {"mac": mac, "ip": ip, "hostname": None})
+
+    # A device that never sent a DHCP hostname still has a MAC, whose OUI
+    # names the vendor ("Apple", "Samsung") — far easier to pick out of a
+    # list than a bare MAC.
+    for dev in seen.values():
+        dev["vendor"] = _mac_vendor(dev["mac"])
+        dev["display_name"] = dev["hostname"] or dev["vendor"] or dev["ip"]
+
     return sorted(seen.values(), key=lambda d: d["ip"])
 
 

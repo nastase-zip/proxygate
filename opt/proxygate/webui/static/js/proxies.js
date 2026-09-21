@@ -12,16 +12,25 @@
 
   let statusFadeTimer = null;
 
+  // Uses the shared topbar status element, same as rules.js. This used to
+  // target a "#proxy-status" element that doesn't exist in the template, so
+  // every call threw a TypeError on the null — which meant no proxy add,
+  // edit, delete or validation message ever reached the user, and the
+  // throw aborted whatever ran after it.
   function setStatus(msg, isError) {
-    const el = document.getElementById("proxy-status");
+    const el = document.getElementById("rules-status");
+    if (!el) return;
     clearTimeout(statusFadeTimer);
-    el.classList.remove("fading");
     el.textContent = msg || "";
-    el.className = "status-line" + (isError ? " error" : msg ? " ok" : "");
+    el.className = "topbar-status" + (isError ? " error" : msg ? " ok" : " hidden");
 
     if (msg && !isError) {
       statusFadeTimer = setTimeout(() => {
         el.classList.add("fading");
+        setTimeout(() => {
+          el.classList.add("hidden");
+          el.classList.remove("fading");
+        }, 400);
       }, 3000);
     }
   }
@@ -128,8 +137,7 @@
       document.getElementById(id).value = "";
     }
     document.getElementById("apf-type").value = "http";
-    document.getElementById("apf-pass").type = "password";
-    document.getElementById("apf-pass-toggle").textContent = "●";
+    setPasswordVisible("apf-pass", "apf-pass-toggle", false);
     PG.showModal("modal-add-proxy");
   }
 
@@ -176,8 +184,7 @@
     document.getElementById("epf-port").value = String(proxy.port || "");
     document.getElementById("epf-login").value = proxy.login || "";
     document.getElementById("epf-pass").value = proxy.password || "";
-    document.getElementById("epf-pass").type = "password";
-    document.getElementById("epf-pass-toggle").textContent = "●";
+    setPasswordVisible("epf-pass", "epf-pass-toggle", false);
     PG.showModal("modal-edit-proxy");
   }
 
@@ -260,11 +267,22 @@
   }
 
   function togglePasswordField(inputId, btnId) {
+    setPasswordVisible(inputId, btnId,
+                       document.getElementById(inputId).type === "password");
+  }
+
+  /* Drives both the input type and the eye icon, so the button can never
+     end up showing the wrong state after a modal reopen. */
+  function setPasswordVisible(inputId, btnId, visible) {
     const input = document.getElementById(inputId);
     const btn = document.getElementById(btnId);
-    const hidden = input.type === "password";
-    input.type = hidden ? "text" : "password";
-    btn.textContent = hidden ? "○" : "●";
+    input.type = visible ? "text" : "password";
+    btn.classList.toggle("on", visible);
+    btn.title = visible ? "Hide password" : "Show password";
+    btn.setAttribute("aria-label", btn.title);
+    const icon = btn.querySelector("i");
+    if (icon) icon.className = visible ? "fa-regular fa-eye-slash"
+                                       : "fa-regular fa-eye";
   }
 
   function hasSelection() { return false; }

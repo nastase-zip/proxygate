@@ -24,16 +24,11 @@
         <span id="conn-indicator-text">connecting…</span>
       </span>
       <div id="sp-status-line" class="status-line"></div>
-      <div id="service-warning-line" class="service-warning hidden"></div>
       <div id="interface-conflict-banner" class="conflict-banner hidden"></div>
     </span>
 
     <span id="topbar-right">
       <button id="gw-toggle-btn" class="gw-idle">Connect</button>
-      <button id="restart-mitm-btn" class="topbar-btn"><i class="fa-solid fa-rotate"></i> Restart mitmproxy</button>
-      <button id="mediastreamer-dns-btn" class="topbar-btn" title="Routes hotspot DNS through 85.203.37.1 / .2, falling back to normal DNS if both are unreachable. Briefly disconnects all hotspot devices while applying." disabled>
-        <i class="fa-solid fa-satellite-dish"></i> Mediastreamer DNS
-      </button>
       <div id="status-dropdown-wrap">
         <button id="status-dropdown-btn" class="icon-btn" title="System status"><i class="fa-solid fa-circle-info"></i></button>
         <div id="status-dropdown" class="hidden">
@@ -87,20 +82,19 @@
       </div>
 
       <div id="panel-devices-inner">
-        <div class="dim-label" id="devices-help">
-          Devices flagged below get real HTTPS decryption (needs the ProxyGate
-          CA installed &amp; trusted on that device). Everything else stays
-          passthrough — no CA needed.
-        </div>
         <div id="device-list" class="scroll-list"></div>
         <div id="devices-footer">
           <a id="ca-cert-link" href="/api/devices/ca-cert" class="full-width" download>
-            <button type="button" class="full-width">↓ Download CA certificate</button>
+            <button type="button" class="full-width">Download CA certificate</button>
           </a>
         </div>
       </div>
 
     </section>
+
+    <!-- Drag to resize the left panel; width persists in localStorage. Same
+         grip treatment as the flow pane's vertical resizer. -->
+    <div id="panel-left-resize" title="Drag to resize"></div>
 
     <!-- ── Center: Traffic ─────────────────────────────────────────── -->
     <section id="panel-traffic" class="panel">
@@ -113,29 +107,108 @@
         </div>
       </div>
 
+      <!-- The header is its own table, fixed above the scrolling area — not
+           a sticky thead inside it. The scroller below carries a matching
+           top padding so the first rows start under the header instead of
+           behind it. Both tables share the same column widths, set together
+           by main.js. -->
       <div class="table-wrap">
-        <table id="traffic-table">
-          <thead>
-            <tr>
-              <th class="resizable">Time</th>
-              <th class="resizable">Source IP</th>
-              <th class="resizable">Destination</th>
-              <th class="resizable">Port</th>
-              <th class="resizable">Type</th>
-              <th class="resizable">Rule</th>
-              <th class="resizable">Proxy</th>
-              <th class="resizable">Status</th>
-              <th class="resizable">Size</th>
-            </tr>
-          </thead>
-          <tbody id="traffic-tbody"></tbody>
-        </table>
+        <div class="table-head">
+          <table id="traffic-head-table">
+            <thead>
+              <tr>
+                <th class="resizable" data-col="time"><span class="th-label">Time</span></th>
+                <th class="resizable" data-col="source_ip"><span class="th-label">Source IP</span></th>
+                <th class="resizable" data-col="destination"><span class="th-label">Destination</span></th>
+                <th class="resizable" data-col="port"><span class="th-label">Port</span></th>
+                <th class="resizable" data-col="type"><span class="th-label">Type</span></th>
+                <th class="resizable" data-col="rule"><span class="th-label">Rule</span></th>
+                <th class="resizable" data-col="proxy"><span class="th-label">Proxy</span></th>
+                <th class="resizable" data-col="status"><span class="th-label">Status</span></th>
+                <th class="resizable" data-col="size"><span class="th-label">Size</span></th>
+              </tr>
+            </thead>
+          </table>
+          <div id="traffic-col-lines"></div>
+        </div>
+        <div class="table-scroll">
+          <table id="traffic-table">
+            <colgroup>
+              <col data-col="time"><col data-col="source_ip"><col data-col="destination">
+              <col data-col="port"><col data-col="type"><col data-col="rule">
+              <col data-col="proxy"><col data-col="status"><col data-col="size">
+            </colgroup>
+            <tbody id="traffic-tbody"></tbody>
+          </table>
+        </div>
       </div>
 
-      <div class="traffic-stats">
-        <span id="traffic-count">Connections: 0</span>
-        <span id="traffic-bytes">&nbsp;|&nbsp;Bytes: 0 B</span>
+      <!-- Request/response detail for the selected row, Charles-style: a
+           pane docked under the table rather than a modal, so the traffic
+           list stays visible while you read a flow. Hidden until a row is
+           clicked. Drag its top edge to resize. -->
+      <div id="flow-pane" class="hidden">
+        <div id="flow-pane-resize" title="Drag to resize"></div>
+        <!-- status chip | url (+copy when truncated) | size | close -->
+        <div id="flow-pane-header">
+          <span id="fd-status" class="fd-status hidden"></span>
+          <span id="fd-title">Request Detail</span>
+          <button id="fd-copy" class="icon-btn fd-copy hidden" title="Copy URL" aria-label="Copy URL">
+            <i class="fa-regular fa-copy"></i>
+          </button>
+          <span id="fd-size" class="fd-size"></span>
+          <button id="fd-close" class="icon-btn" title="Close detail" aria-label="Close detail">✕</button>
+        </div>
+        <div id="fd-empty" class="dim-label hidden">
+          No captured detail for this connection. It was raw-TLS passthrough (not decrypted) or not an HTTP/S flow, so there's nothing beyond what's already in the table row.
+        </div>
+        <!-- Key facts pulled out of the headers so the common questions
+             (what type, how big, what server) are answered without reading
+             a header dump. Populated by flow-detail.js. -->
+        <div id="fd-summary" class="fd-summary hidden"></div>
+
+        <div id="fd-body" class="fd-columns hidden">
+          <div class="fd-col">
+            <div class="fd-col-head">
+              <span class="fd-col-title">Request <span id="fd-method" class="fd-method"></span></span>
+              <span class="fd-tabs">
+                <button class="fd-tab active" data-side="request" data-view="headers">Headers <span class="fd-count" id="fd-request-count"></span></button>
+                <button class="fd-tab" data-side="request" data-view="body">Body <span id="fd-request-truncated" class="fd-truncated-badge hidden">cut</span></button>
+              </span>
+            </div>
+            <div id="fd-request-headers" class="fd-view fd-headers"></div>
+            <!-- The copy button sits on the wrapper, not inside the <pre>,
+                 so it stays put while the body scrolls under it. -->
+            <div id="fd-request-body-wrap" class="fd-view fd-body-wrap hidden">
+              <button class="icon-btn fd-body-copy" data-side="request" title="Copy body" aria-label="Copy body">
+                <i class="fa-regular fa-copy"></i>
+              </button>
+              <pre id="fd-request-body" class="fd-pre"></pre>
+            </div>
+          </div>
+          <div class="fd-col">
+            <div class="fd-col-head">
+              <span class="fd-col-title">Response</span>
+              <span class="fd-tabs">
+                <button class="fd-tab active" data-side="response" data-view="headers">Headers <span class="fd-count" id="fd-response-count"></span></button>
+                <button class="fd-tab" data-side="response" data-view="body">Body <span id="fd-response-truncated" class="fd-truncated-badge hidden">cut</span></button>
+              </span>
+            </div>
+            <div id="fd-response-headers" class="fd-view fd-headers"></div>
+            <div id="fd-response-body-wrap" class="fd-view fd-body-wrap hidden">
+              <button class="icon-btn fd-body-copy" data-side="response" title="Copy body" aria-label="Copy body">
+                <i class="fa-regular fa-copy"></i>
+              </button>
+              <pre id="fd-response-body" class="fd-pre"></pre>
+            </div>
+          </div>
+        </div>
       </div>
+
+      <!-- Spans kept on one line: .traffic-stats is white-space: pre-wrap
+           (so the padding around the "|" survives), which would otherwise
+           also render the newline and indentation between these tags. -->
+      <div class="traffic-stats"><span id="traffic-count">Connections: 0</span><span id="traffic-bytes">  |  Bytes: 0 B</span></div>
     </section>
 
   </main>
@@ -153,10 +226,24 @@
   <label class="dim-label">Name</label>
   <input id="af-name" type="text">
   <label class="dim-label">Patterns (one per line or ;)</label>
-  <textarea id="af-pattern" rows="3" placeholder="*.google.com&#10;*.youtube.com"></textarea>
+  <textarea id="af-pattern" rows="3" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
+  <p class="modal-note">
+    <i class="fa-solid fa-circle-info"></i>
+    <span>
+      <code>*.google.com</code> matches by wildcard (and the bare domain too).
+      Wrap a pattern in single quotes for a regex:
+      <code>&#39;^cdn\d+\.example\.com$&#39;</code>. Regexes are
+      case-insensitive and match anywhere unless you anchor with
+      <code>^</code> / <code>$</code>.
+    </span>
+  </p>
   <label class="dim-label">Proxy</label>
   <select id="af-proxy"></select>
-  <label class="checkbox-row"><input id="af-enabled" type="checkbox" checked> Enabled</label>
+  <div class="checkbox-row">
+    <input id="af-enabled" type="checkbox" checked>
+    <span class="pg-check-box"><i class="fa-solid fa-check"></i></span>
+    <span>Enabled</span>
+  </div>
   <div class="btn-row modal-actions">
     <button id="af-save" class="primary modal-confirm">Save</button>
   </div>
@@ -170,10 +257,24 @@
   <label class="dim-label">Name</label>
   <input id="ef-name" type="text">
   <label class="dim-label">Patterns (one per line or ;)</label>
-  <textarea id="ef-pattern" rows="3"></textarea>
+  <textarea id="ef-pattern" rows="3" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
+  <p class="modal-note">
+    <i class="fa-solid fa-circle-info"></i>
+    <span>
+      <code>*.google.com</code> matches by wildcard (and the bare domain too).
+      Wrap a pattern in single quotes for a regex:
+      <code>&#39;^cdn\d+\.example\.com$&#39;</code>. Regexes are
+      case-insensitive and match anywhere unless you anchor with
+      <code>^</code> / <code>$</code>.
+    </span>
+  </p>
   <label class="dim-label">Proxy</label>
   <select id="ef-proxy"></select>
-  <label class="checkbox-row"><input id="ef-enabled" type="checkbox"> Enabled</label>
+  <div class="checkbox-row">
+    <input id="ef-enabled" type="checkbox">
+    <span class="pg-check-box"><i class="fa-solid fa-check"></i></span>
+    <span>Enabled</span>
+  </div>
   <div class="btn-row modal-actions">
     <button id="ef-save" class="primary modal-confirm">Save</button>
   </div>
@@ -201,7 +302,8 @@
   <label class="dim-label">Password</label>
   <div class="pass-row">
     <input id="apf-pass" type="password">
-    <button id="apf-pass-toggle" type="button">●</button>
+    <button id="apf-pass-toggle" class="pass-toggle" type="button"
+            title="Show password" aria-label="Show password"><i class="fa-regular fa-eye"></i></button>
   </div>
   <div class="btn-row modal-actions">
     <button id="apf-save" class="primary modal-confirm">Save</button>
@@ -230,7 +332,8 @@
   <label class="dim-label">Password</label>
   <div class="pass-row">
     <input id="epf-pass" type="password">
-    <button id="epf-pass-toggle" type="button">●</button>
+    <button id="epf-pass-toggle" class="pass-toggle" type="button"
+            title="Show password" aria-label="Show password"><i class="fa-regular fa-eye"></i></button>
   </div>
   <div class="btn-row modal-actions">
     <button id="epf-save" class="primary modal-confirm">Save</button>
@@ -253,64 +356,47 @@
   </div>
 </div>
 
-<div id="modal-flow-detail" class="modal modal-wide hidden">
-  <div class="modal-header">
-    <h3 id="fd-title">Request Detail</h3>
-    <button id="fd-close" class="modal-close" title="Close" aria-label="Close">✕</button>
-  </div>
-  <div id="fd-empty" class="dim-label hidden">
-    No captured detail for this connection — it was raw-TLS passthrough (not decrypted) or not an HTTP/S flow, so there's nothing beyond what's already in the table row.
-  </div>
-  <div id="fd-body" class="fd-columns hidden">
-    <div class="fd-col">
-      <div class="fd-col-title">Request</div>
-      <div class="fd-section-label">Headers</div>
-      <pre id="fd-request-headers" class="fd-pre"></pre>
-      <div class="fd-section-label">Body <span id="fd-request-truncated" class="fd-truncated-badge hidden">truncated</span></div>
-      <pre id="fd-request-body" class="fd-pre fd-body-pre"></pre>
-    </div>
-    <div class="fd-col">
-      <div class="fd-col-title">Response</div>
-      <div class="fd-section-label">Headers</div>
-      <pre id="fd-response-headers" class="fd-pre"></pre>
-      <div class="fd-section-label">Body <span id="fd-response-truncated" class="fd-truncated-badge hidden">truncated</span></div>
-      <pre id="fd-response-body" class="fd-pre fd-body-pre"></pre>
-    </div>
-  </div>
-</div>
-
 <div id="modal-settings" class="modal hidden">
   <div class="modal-header">
     <h3>Settings</h3>
     <button id="sf-cancel" class="modal-close" title="Close" aria-label="Close">✕</button>
   </div>
-  <label class="dim-label">WAN interface</label>
-  <select id="sf-wan"></select>
-  <button id="sf-detect" class="full-width">↺ Detect</button>
+  <!-- WAN interface, gateway IP and WiFi adapter are deliberately NOT
+       editable here: all three are auto-detected at connect time
+       (detect_wan_if / resolve_ap_wifi_if), and the gateway subnet has
+       never needed changing. Removing them keeps this modal to the
+       settings that actually do something. -->
   <label class="dim-label">Hotspot SSID</label>
   <input id="sf-ssid" type="text">
   <label class="dim-label">Hotspot password</label>
   <div class="pass-row">
     <input id="sf-pass" type="password">
-    <button id="sf-pass-toggle" type="button">●</button>
+    <button id="sf-pass-toggle" class="pass-toggle" type="button"
+            title="Show password" aria-label="Show password"><i class="fa-regular fa-eye"></i></button>
   </div>
-  <label class="dim-label">Gateway IP (e.g. 192.168.100.1)</label>
-  <input id="sf-gw" type="text">
-  <label class="dim-label">WiFi adapter (* = auto)</label>
-  <input id="sf-wifi-if" type="text">
   <label class="dim-label">WiFi band</label>
   <select id="sf-band">
     <option value="">Auto (let driver decide)</option>
     <option value="bg">2.4 GHz</option>
     <option value="a">5 GHz</option>
   </select>
-  <label class="dim-label">
-    IPv6 for upstream proxies is handled automatically.
-  </label>
-  <label class="checkbox-row">
+  <!-- A note, not a field label — styled as a hint so it doesn't read as
+       the caption for the checkbox below it. -->
+  <p class="modal-note">
+    <i class="fa-solid fa-circle-info"></i>
+    IPv6 for upstream proxies is handled automatically if the network
+    you're on has a default IPv6 adapter.
+  </p>
+  <div class="checkbox-row">
     <input id="sf-show-quic" type="checkbox">
-    Show blocked QUIC attempts in the traffic table
-  </label>
+    <span class="pg-check-box"><i class="fa-solid fa-check"></i></span>
+    <span>Show blocked QUIC attempts in the traffic table</span>
+  </div>
+  <div class="checkbox-row">
+    <input id="sf-full-lines" type="checkbox">
+    <span class="pg-check-box"><i class="fa-solid fa-check"></i></span>
+    <span>Full-height column dividers in the traffic table</span>
+  </div>
   <div class="btn-row modal-actions">
     <button id="sf-save" class="primary modal-confirm">Save</button>
   </div>
