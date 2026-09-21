@@ -1079,7 +1079,18 @@ body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-sel
   color: var(--text-dim);
   font-size: 11px; line-height: 1.4;
 }
-.modal-note i { margin-top: 1px; flex-shrink: 0; }
+/* Centre the glyph on the first line of text rather than on the top of the
+   box. The icon's own line box is shorter than the 11px/1.4 text line, so
+   matching that line-height is what lines the two up; without it the glyph
+   sits high and the note looks top-heavy. */
+.modal-note i {
+  flex-shrink: 0;
+  line-height: 1.4;
+  font-size: 11px;
+}
+/* Validation failure, styled exactly like any other note. No colour at all:
+   the box only ever appears when something is wrong, so its presence is the
+   signal — colouring it as well just makes the dialog shout. */
 /* Inline pattern examples — monospace so the wildcards, quotes and escapes
    are unambiguous at 11px. */
 .modal-note code {
@@ -1340,6 +1351,10 @@ tbody tr.row-selected { outline: 1px solid var(--accent); outline-offset: -1px; 
 .fd-hname { color: var(--accent); word-break: break-word; }
 .fd-hval { color: var(--text); word-break: break-word; }
 .fd-empty-note { padding: 6px 8px; color: var(--text-dim); font-size: 11px; }
+/* Search hides rows rather than removing them, so clearing the box brings
+   them straight back with no refetch. */
+.row-filtered-out { display: none; }
+
 .row-clickable { cursor: pointer; }
 .row-clickable:hover { background: rgba(255,255,255,0.05); }
 

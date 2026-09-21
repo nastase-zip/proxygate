@@ -273,6 +273,7 @@
     document.getElementById("af-pattern").value = "";
     document.getElementById("af-enabled").checked = true;
     fillSelect(document.getElementById("af-proxy"), proxyDisplayItems(), "DIRECT");
+    clearPatternError("af");
     PG.showModal("modal-add-rule");
   }
 
@@ -287,7 +288,23 @@
     document.getElementById("ef-pattern").value = rule.pattern || "";
     document.getElementById("ef-enabled").checked = rule.enabled !== false;
     fillSelect(document.getElementById("ef-proxy"), proxyDisplayItems(), rule.proxy || "DIRECT");
+    clearPatternError("ef");
     PG.showModal("modal-edit-rule");
+  }
+
+  // Validation feedback for the pattern field, shown inline under it rather
+  // than only in the topbar — the user is looking at the dialog, not the top
+  // of the page, and the message (an invalid or rejected regex) is about the
+  // field directly above it.
+  function setPatternError(prefix, msg) {
+    const box = document.getElementById(`${prefix}-pattern-error`);
+    if (!box) return;
+    box.classList.toggle("hidden", !msg);
+    box.querySelector("span").textContent = msg || "";
+  }
+
+  function clearPatternError(prefix) {
+    setPatternError(prefix, "");
   }
 
   async function saveAdd() {
@@ -295,8 +312,9 @@
     const pattern = document.getElementById("af-pattern").value.trim();
     const proxy = document.getElementById("af-proxy").value;
     const enabled = document.getElementById("af-enabled").checked;
+    clearPatternError("af");
     if (!name || !pattern) {
-      setStatus("Name and pattern are required.", true);
+      setPatternError("af", "Name and pattern are both required.");
       return;
     }
     try {
@@ -308,7 +326,8 @@
       render();
     } catch (e) {
       PG.log.error(TAG, "Add rule failed", { error: e.message });
-      setStatus(e.message, true);
+      // Stays open so the pattern can be corrected in place.
+      setPatternError("af", e.message);
     }
   }
 
@@ -318,8 +337,9 @@
     const pattern = document.getElementById("ef-pattern").value.trim();
     const proxy = document.getElementById("ef-proxy").value;
     const enabled = document.getElementById("ef-enabled").checked;
+    clearPatternError("ef");
     if (!name || !pattern) {
-      setStatus("Name and pattern are required.", true);
+      setPatternError("ef", "Name and pattern are both required.");
       return;
     }
     try {
@@ -331,7 +351,7 @@
       render();
     } catch (e) {
       PG.log.error(TAG, "Update rule failed", { error: e.message });
-      setStatus(e.message, true);
+      setPatternError("ef", e.message);
     }
   }
 
@@ -446,6 +466,10 @@
     document.getElementById("apply-rules-btn").addEventListener("click", applyNow);
 
     document.getElementById("af-save").addEventListener("click", saveAdd);
+    // Clear the inline error as soon as the user starts correcting it, so a
+    // stale message doesn't sit under a field they've already fixed.
+    document.getElementById("af-pattern").addEventListener("input", () => clearPatternError("af"));
+    document.getElementById("ef-pattern").addEventListener("input", () => clearPatternError("ef"));
     document.getElementById("af-cancel").addEventListener("click", () => PG.hideModal("modal-add-rule"));
     document.getElementById("ef-save").addEventListener("click", saveEdit);
     document.getElementById("ef-cancel").addEventListener("click", () => PG.hideModal("modal-edit-rule"));

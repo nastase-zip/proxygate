@@ -980,11 +980,50 @@ def _note_decrypt_success(mac: str, host: str) -> None:
 _mac_snapshot: dict[str, str] = {}
 _mac_snapshot_lock = threading.Lock()
 _MAC_SNAPSHOT_REFRESH_SECS = 3.0
+# Set by _resolve_mac() on a miss so the refresher re-reads immediately
+# instead of sleeping out the rest of its interval. Bounded below by
+# _MAC_SNAPSHOT_MIN_SECS so a burst of unknown IPs can't turn the refresh
+# into a hot loop shelling out to `ip neigh` continuously.
+_mac_refresh_now = threading.Event()
+_MAC_SNAPSHOT_MIN_SECS = 0.5
 
 
 def _resolve_mac(ip: str) -> Optional[str]:
     with _mac_snapshot_lock:
-        return _mac_snapshot.get(ip)
+        mac = _mac_snapshot.get(ip)
+    if mac is None:
+        # A device that has only just joined isn't in the snapshot yet, so
+        # its first connections resolve to no MAC and silently fall through
+        # to passthrough — even when it IS on the decrypt allowlist. Those
+        # early connections (app launch, login) are often the ones worth
+        # capturing, so ask the refresher to re-read now rather than waiting
+        # out the rest of the poll interval.
+        #
+        # Only a nudge: this stays non-blocking (setting an event, no I/O on
+        # the proxy's event loop), so this connection still goes through as
+        # passthrough. It shortens the blind window for the ones behind it
+        # from up to _MAC_SNAPSHOT_REFRESH_SECS to roughly one refresh.
+        _mac_refresh_now.set()
+        _note_unresolved_mac(ip)
+    return mac
+
+
+# IPs seen with no MAC, logged once each. Without this the only symptom of a
+# device never being decrypted is silence — no error, no row, nothing to
+# distinguish "not on the allowlist" from "we couldn't identify it".
+_unresolved_macs: set = set()
+_unresolved_lock = threading.Lock()
+
+
+def _note_unresolved_mac(ip: str) -> None:
+    with _unresolved_lock:
+        if ip in _unresolved_macs:
+            return
+        _unresolved_macs.add(ip)
+    _log.info("[proxygate] no MAC known for %s yet — decryption cannot be "
+              "evaluated for it until the device table refreshes. If this "
+              "persists, the device may not have a DHCP lease or ARP entry "
+              "on the hotspot interface.", ip)
 
 
 class MacSnapshotRefresher:
@@ -1015,7 +1054,14 @@ class MacSnapshotRefresher:
                 # the old inline version's "decryption silently never
                 # engages for ANY device" when resolution broke.
                 _log.debug(f"[proxygate] MacSnapshotRefresher: {traceback.format_exc()}")
-            time.sleep(_MAC_SNAPSHOT_REFRESH_SECS)
+
+            # Wake early when _resolve_mac() saw an IP it couldn't identify
+            # (a device that just joined), so its next connections can be
+            # evaluated for decryption instead of waiting out the interval.
+            # The floor keeps a stream of unknown IPs from spinning this.
+            if _mac_refresh_now.wait(timeout=_MAC_SNAPSHOT_REFRESH_SECS):
+                _mac_refresh_now.clear()
+                time.sleep(_MAC_SNAPSHOT_MIN_SECS)
 
 
 # ── Watcher ───────────────────────────────────────────────────────────────────

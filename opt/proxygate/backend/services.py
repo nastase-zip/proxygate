@@ -407,7 +407,7 @@ def _nmcli_ap_status() -> str:
 # ── IPv6 client link (second virtual interface, same phy as the AP) ──────────
 #
 # Problem: an upstream proxy may be IPv6-only and IP-allowlisted — a tunnel
-# (tried and reverted, see ARCHITECTURE.md) can't satisfy that, since a
+# (WireGuard/WARP was tried and reverted) can't satisfy that, since a
 # tunnel's outbound packets always carry the tunnel's own address, never
 # this machine's. There's no way around that for a tunnel; a proxy that
 # authorizes by source IP will just silently reject a tunnel's identity.
@@ -1003,8 +1003,13 @@ def apply_iptables() -> tuple[bool, str]:
         _r   ("iptables", "-N", "PROXYGATE_BLOCKDEV")
         _must("iptables", "-F", "PROXYGATE_BLOCKDEV")
         for mac in _blocked_mac_set():
-            _must("iptables", "-A", "PROXYGATE_BLOCKDEV",
-                  "-i", hi, "-m", "mac", "--mac-source", mac, "-j", "DROP")
+            # _r, not _must: a single unusable MAC must not abort the entire
+            # iptables setup. blocked_mac_set() already filters malformed
+            # entries, but this is the call that actually decides whether the
+            # gateway comes up at all — failing one DROP rule costs one
+            # device's block, failing the whole chain costs the hotspot.
+            _r("iptables", "-A", "PROXYGATE_BLOCKDEV",
+               "-i", hi, "-m", "mac", "--mac-source", mac, "-j", "DROP")
         _r   ("iptables", "-D", "INPUT",   "-j", "PROXYGATE_BLOCKDEV")
         _must("iptables", "-I", "INPUT",   "1", "-j", "PROXYGATE_BLOCKDEV")
         _r   ("iptables", "-D", "FORWARD", "-j", "PROXYGATE_BLOCKDEV")
@@ -1947,7 +1952,7 @@ def check_proxy_latency(host: str, port: int, timeout: float = 3.0) -> Optional[
     immediately every time, showing no latency in the UI at all, regardless
     of whether the proxy itself is actually reachable. For an IPv6 address,
     this naturally routes over whatever the kernel's IPv6 route table says
-    (nothing, unless WAN itself has real IPv6 — see ARCHITECTURE.md).
+    (nothing, unless this machine's own WAN connection has real IPv6).
     """
     start = time.monotonic()
     try:

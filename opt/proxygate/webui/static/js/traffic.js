@@ -1,14 +1,17 @@
 /**
- * traffic.js — Live traffic feed, scoped to the current server session.
+ * traffic.js — Live traffic feed.
  *
- * Rows logged before this `sudo proxygate` process started are never loaded:
- * the table begins empty on each restart rather than dumping the entire
- * lifetime history into the browser.
+ * The table shows the most recent HISTORY_LIMIT rows on load, whichever
+ * process logged them, and tails new ones from there. Keeping the window
+ * small is what stops a restart or a refresh from dragging the whole
+ * lifetime history into the browser; the counters in the footer are still
+ * scoped to the current run.
  *
- *   1. History — fetched once at startup, in full (see loadHistory). This
- *      deliberately replaced scroll-up pagination, which grew the content
- *      every time you neared the top and made the scrollbar impossible to
- *      drag to the actual top.
+ *   1. History — the most recent HISTORY_LIMIT rows, fetched once at startup
+ *      (see loadHistory). This deliberately replaced scroll-up pagination,
+ *      which grew the content every time you neared the top and made the
+ *      scrollbar impossible to drag to the actual top. The window is capped
+ *      so a refresh stays fast however long the gateway has been running.
  *
  *   2. Live tail — poll /api/traffic/live?since=<last id> every 500ms and
  *      append new rows at the bottom, never touching scrollTop. The thumb
@@ -25,9 +28,21 @@
 
   const TAG = "traffic";
   const LIVE_POLL_MS = 500;
-  // Upper bound on the session history fetched at startup. Not a page size —
-  // there is no paging; see loadHistory for why.
-  const HISTORY_LIMIT = 20000;
+
+  // How many of the most recent rows to render on load. NOT a page size:
+  // there is no paging, and nothing older than this window is fetched.
+  //
+  // SESSION_FLOOR_ID is fixed when the server process starts, so the session
+  // keeps growing for as long as proxygate runs. Without a cap, a refresh a
+  // few hours in meant a multi-megabyte payload and tens of thousands of
+  // <tr>s built before anything appeared on screen. Capping keeps load
+  // instant no matter how long the gateway has been up.
+  //
+  // Older rows aren't lost: they stay in traffic.db and still come out in a
+  // CSV export. They're just not rendered, because nobody scrolls back
+  // through thousands of rows looking for one, they filter instead (which
+  // queries the whole session server-side, not just this window).
+  const HISTORY_LIMIT = 50;
 
   let sessionFloorId = 0;
   let liveSinceId = 0;       // cursor for the forward/live poll
@@ -112,7 +127,125 @@
       td.textContent = c;
       tr.appendChild(td);
     }
+
+    // Everything the search bar can match on, lowercased once at build time
+    // so filtering is a plain string compare per row rather than re-reading
+    // and re-casing the DOM on every keystroke.
+    tr._pg = {
+      ip:     (row.source_ip || "").toLowerCase(),
+      sni:    (row.dest_host || "").toLowerCase(),
+      port:   String(row.dest_port || ""),
+      type:   protocol.toLowerCase(),
+      rule:   (row.rule_matched || "").toLowerCase(),
+      proxy:  proxy.toLowerCase(),
+      status: row.status_code != null ? String(row.status_code) : "",
+    };
+    tr._pgAll = Object.values(tr._pg).join(" ");
     return tr;
+  }
+
+  // ── Search ───────────────────────────────────────────────────────────────────
+  //
+  // Filtering is client-side over the rows already loaded, so typing is
+  // instant and doesn't refetch.
+  //
+  // Plain substring search over every column is always on: typing
+  // "google.com" or "192.168.100.5" narrows the table.
+  //
+  // FIELD_SEARCH additionally enables `field==value` syntax:
+  //
+  //   type==tls           field equals value exactly
+  //   sni~=google         field contains value
+  //   ip==192.168.100.5   field equals value
+  //
+  // ...with multiple terms AND-ed together, and these field names:
+  // ip/src/source, sni/host/dest, port, type/protocol/proto, rule, proxy,
+  // status/code.
+  //
+  // Off by default: the syntax works but the interaction needs more thought
+  // before users see it. Flip this to true to turn it back on; nothing else
+  // needs changing, and the placeholder text follows this flag automatically
+  // (see initFilterPlaceholder).
+  const FIELD_SEARCH = false;
+
+  const FIELD_ALIASES = {
+    ip: "ip", source: "ip", src: "ip",
+    sni: "sni", host: "sni", dest: "sni", destination: "sni",
+    port: "port",
+    type: "type", protocol: "type", proto: "type",
+    rule: "rule",
+    proxy: "proxy",
+    status: "status", code: "status",
+  };
+
+  // "type==tls", "sni~=google", or bare text. The operator is captured so
+  // == can mean exact and ~= contains.
+  const TERM_RE = /^([a-z]+)\s*(==|~=|=)\s*(.*)$/i;
+
+  function parseQuery(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return [];
+
+    // With field search off, the query is one literal substring. Not split
+    // on spaces: "Request Detail" should match that phrase, and a stray
+    // "==" is then just characters to look for rather than syntax.
+    if (!FIELD_SEARCH) {
+      return [{ field: null, op: "~=", value: trimmed.toLowerCase() }];
+    }
+
+    return trimmed
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((raw) => {
+        const m = raw.match(TERM_RE);
+        if (!m) return { field: null, op: "~=", value: raw.toLowerCase() };
+        const field = FIELD_ALIASES[m[1].toLowerCase()];
+        if (!field) return { field: null, op: "~=", value: raw.toLowerCase() };
+        // "==" is exact; "=" and "~=" both mean contains, since a bare "="
+        // reads as "is" to most people but they rarely want it strict.
+        return { field, op: m[2] === "==" ? "==" : "~=", value: m[3].toLowerCase() };
+      });
+  }
+
+  function rowMatches(tr, terms) {
+    for (const t of terms) {
+      const hay = t.field ? (tr._pg[t.field] || "") : (tr._pgAll || "");
+      const ok = t.op === "==" ? hay === t.value : hay.includes(t.value);
+      if (!ok) return false;
+    }
+    return true;
+  }
+
+  // Keeps the input's hint in step with FIELD_SEARCH, so flipping that one
+  // flag is genuinely all it takes: the box never advertises syntax that
+  // isn't active, and never hides it when it is.
+  function initFilterPlaceholder() {
+    const el = document.getElementById("traffic-filter");
+    if (!el) return;
+    if (FIELD_SEARCH) {
+      el.placeholder = "Filter… e.g. google.com, type==tls, ip==192.168.100.5";
+      el.title = "Plain text matches any column.\n"
+               + "field==value is exact, field~=value contains.\n"
+               + "Fields: ip, sni (host), port, type, rule, proxy, status.\n"
+               + "Several terms are combined with AND.";
+    } else {
+      el.placeholder = "Filter by host or IP…";
+      el.title = "Matches any column in the loaded rows.";
+    }
+  }
+
+  function applyFilter() {
+    const tbody = document.getElementById("traffic-tbody");
+    const terms = filter ? parseQuery(filter) : [];
+    let shown = 0;
+    for (const tr of tbody.children) {
+      const visible = !terms.length || rowMatches(tr, terms);
+      // A class rather than style.display so it can't fight the stylesheet,
+      // and so content-visibility keeps skipping the hidden ones.
+      tr.classList.toggle("row-filtered-out", !visible);
+      if (visible) shown++;
+    }
+    return shown;
   }
 
   function updateStats(stats) {
@@ -141,29 +274,37 @@
     }
 
     await loadHistory();
+    // Re-apply any active search to the freshly loaded rows: this runs when
+    // the QUIC toggle changes, and the search box keeps its text.
+    if (filter) applyFilter();
   }
 
   // ── History ─────────────────────────────────────────────────────────────────
 
-  // The whole session's history in one request, rather than paging it in as
-  // the user scrolls up.
+  // The most recent HISTORY_LIMIT rows in one request, rather than paging
+  // more in as the user scrolls up.
   //
   // Paging was what made the scrollbar unusable: every time you neared the
   // top it inserted another 50 rows and corrected scrollTop to keep your
   // visual position, so the content got taller, the thumb jumped back down
   // and the top receded. Reaching the actual top took several drags. Loading
-  // once means the scroll height is fixed except when live rows arrive, so
-  // dragging up goes up and dragging down goes down.
+  // once means the scroll height only ever grows at the bottom, as live rows
+  // arrive, so dragging up goes up and dragging down goes down.
   //
-  // Session rows are bounded (the view starts empty on each restart) and a
-  // few thousand rows of plain text costs a browser nothing — especially
-  // with content-visibility skipping layout for off-screen rows.
+  // The window is capped rather than unbounded because the session grows for
+  // as long as the server process runs (see HISTORY_LIMIT) — fetching all of
+  // it made a mid-session refresh slow to the point of feeling broken.
   async function loadHistory() {
     if (loadingHistory) return;
     loadingHistory = true;
     try {
       const params = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
-      if (filter) params.set("q", filter);
+      // Let the server drop blocked-QUIC rows when we're not showing them,
+      // so HISTORY_LIMIT counts rows that actually get rendered. Without
+      // this the window filled up with rows shouldRenderRow() then threw
+      // away — on a QUIC-heavy session, 200 fetched rows could leave only a
+      // handful on screen.
+      if (!showQuic) params.set("quic", "0");
 
       const res = await PG.api.get(`/api/traffic/history?${params.toString()}`);
       const rows = res.rows || [];
@@ -225,18 +366,23 @@
   function appendLiveRows(rows) {
     const tbody = document.getElementById("traffic-tbody");
     const frag = document.createDocumentFragment();
+    // Parsed once per batch rather than per row.
+    const terms = filter ? parseQuery(filter) : [];
     let matched = 0;
     for (const row of rows) {
       newestLoadedId = row.id;
       if (!shouldRenderRow(row)) continue;
-      if (filter) {
-        const f = filter.toLowerCase();
-        const hit = (row.dest_host || "").toLowerCase().includes(f) || (row.source_ip || "").toLowerCase().includes(f);
-        if (!hit) continue;
+      const tr = buildRowEl(row);
+      // A live row that doesn't match the active search is still added,
+      // just hidden — so clearing the search reveals it instead of leaving
+      // a gap in the timeline that only a refresh would fill.
+      if (terms.length && !rowMatches(tr, terms)) {
+        tr.classList.add("row-filtered-out");
+      } else {
+        matched++;
       }
-      frag.appendChild(buildRowEl(row));
+      frag.appendChild(tr);
       rowCount++;
-      matched++;
     }
     if (matched) {
       // Appending at the bottom only ever grows the content below the
@@ -264,11 +410,14 @@
   function onFilterChange(e) {
     const value = e.target.value.trim();
     clearTimeout(filterDebounceTimer);
+    // Short debounce: this is a local show/hide pass over rows already in
+    // the DOM, not a request, so it can be near-instant. The delay only
+    // exists to avoid re-running mid-word on fast typing.
     filterDebounceTimer = setTimeout(() => {
       filter = value;
-      PG.log.info(TAG, "Search changed — re-querying server", { filter });
-      resetAndLoadNewest();
-    }, 250);
+      const shown = applyFilter();
+      PG.log.info(TAG, "Search applied (client-side)", { filter, shown });
+    }, 80);
   }
 
   function onClear() {
@@ -309,6 +458,7 @@
   }
 
   function init() {
+    initFilterPlaceholder();
     document.getElementById("traffic-filter").addEventListener("input", onFilterChange);
     document.getElementById("traffic-clear-btn").addEventListener("click", onClear);
     document.getElementById("traffic-export-btn").addEventListener("click", onExport);
@@ -323,15 +473,12 @@
   window.PG = window.PG || {};
   function setShowQuic(show) {
     showQuic = show;
-    // Toggle already-rendered rows in place rather than re-fetching/
-    // re-rendering the whole table — the rows are already in the DOM
-    // (tagged with data-protocol in buildRowEl), this is just a visibility
-    // flip, purely cosmetic and instant.
-    const tbody = document.getElementById("traffic-tbody");
-    for (const tr of tbody.querySelectorAll('tr[data-protocol="QUIC (blocked)"]')) {
-      tr.hidden = !show;
-    }
-    PG.log.info(TAG, "Show-QUIC preference changed", { show });
+    // Must refetch, not just unhide: the history request now asks the server
+    // to leave blocked-QUIC rows out entirely when the preference is off
+    // (so HISTORY_LIMIT counts visible rows), which means turning it back on
+    // has no hidden rows to reveal — they were never sent.
+    PG.log.info(TAG, "Show-QUIC preference changed — reloading history", { show });
+    resetAndLoadNewest();
   }
 
   window.PG.traffic = { pollLive, setShowQuic };

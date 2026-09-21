@@ -99,6 +99,8 @@
     <!-- ── Center: Traffic ─────────────────────────────────────────── -->
     <section id="panel-traffic" class="panel">
       <div class="traffic-toolbar">
+        <!-- Placeholder/title are set by traffic.js, which knows whether the
+             field-search syntax is enabled (see FIELD_SEARCH). -->
         <input id="traffic-filter" type="text" placeholder="Filter by host or IP…">
         <button id="traffic-focus-btn">Focus</button>
         <div class="toolbar-icon-group">
@@ -227,15 +229,9 @@
   <input id="af-name" type="text">
   <label class="dim-label">Patterns (one per line or ;)</label>
   <textarea id="af-pattern" rows="3" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
-  <p class="modal-note">
+  <p class="modal-note modal-note-error hidden" id="af-pattern-error">
     <i class="fa-solid fa-circle-info"></i>
-    <span>
-      <code>*.google.com</code> matches by wildcard (and the bare domain too).
-      Wrap a pattern in single quotes for a regex:
-      <code>&#39;^cdn\d+\.example\.com$&#39;</code>. Regexes are
-      case-insensitive and match anywhere unless you anchor with
-      <code>^</code> / <code>$</code>.
-    </span>
+    <span></span>
   </p>
   <label class="dim-label">Proxy</label>
   <select id="af-proxy"></select>
@@ -258,15 +254,9 @@
   <input id="ef-name" type="text">
   <label class="dim-label">Patterns (one per line or ;)</label>
   <textarea id="ef-pattern" rows="3" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
-  <p class="modal-note">
+  <p class="modal-note modal-note-error hidden" id="ef-pattern-error">
     <i class="fa-solid fa-circle-info"></i>
-    <span>
-      <code>*.google.com</code> matches by wildcard (and the bare domain too).
-      Wrap a pattern in single quotes for a regex:
-      <code>&#39;^cdn\d+\.example\.com$&#39;</code>. Regexes are
-      case-insensitive and match anywhere unless you anchor with
-      <code>^</code> / <code>$</code>.
-    </span>
+    <span></span>
   </p>
   <label class="dim-label">Proxy</label>
   <select id="ef-proxy"></select>

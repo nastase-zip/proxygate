@@ -205,6 +205,42 @@ def test_seen_devices_endpoint(client, monkeypatch):
 
 # ── misc routes ───────────────────────────────────────────────────────────────
 
+# ── traffic window ────────────────────────────────────────────────────────────
+
+def test_history_returns_recent_rows_on_a_fresh_process(client, monkeypatch):
+    """
+    Regression: SESSION_FLOOR_ID used to be db.get_max_id(), set at process
+    start, so on a fresh `sudo proxygate` the floor WAS the newest row and
+    the history window was always empty. The row limit is what bounds the
+    payload now, so the floor must not also hide everything.
+    """
+    monkeypatch.setattr(web_mod.db, "get_history_page",
+                        lambda floor, **kw: [{"id": 1, "floor_seen": floor}])
+    r = client.get("/api/traffic/history?limit=50")
+    assert r.status_code == 200
+    rows = body(r)["rows"]
+    assert rows, "a fresh process must still return recent history"
+    assert rows[0]["floor_seen"] == 0, "no session floor should be applied"
+
+
+def test_live_tail_without_since_does_not_replay_history(client, monkeypatch):
+    """
+    /api/traffic/live is a tail. With no `since` it must start from the
+    newest row, never from 0 — otherwise a caller omitting the cursor pulls
+    the whole table back.
+    """
+    seen = {}
+
+    def fake_since(since, limit=200):
+        seen["since"] = since
+        return []
+
+    monkeypatch.setattr(web_mod.db, "get_connections_since", fake_since)
+    monkeypatch.setattr(web_mod.db, "get_max_id", lambda: 9999)
+    client.get("/api/traffic/live")
+    assert seen["since"] == 9999
+
+
 def test_index_serves_html(client):
     r = client.get("/")
     assert r.status_code == 200
@@ -221,3 +257,36 @@ def test_settings_get_shape(client, monkeypatch):
     r = client.get("/api/settings")
     assert r.status_code == 200
     assert "config" in body(r) and "interfaces" in body(r)
+
+
+# ── concurrency ───────────────────────────────────────────────────────────────
+
+def test_concurrent_rule_writes_are_not_lost(client):
+    """
+    Regression: every mutating handler does load -> mutate -> save, and the
+    server runs 8 waitress threads, so two saves could interleave and the
+    second would silently discard the first. Measured at 154/200 writes lost
+    before rules_transaction() made the cycle atomic.
+    """
+    import threading
+
+    client.get("/api/rules")
+    before = len(body(client.get("/api/rules"))["data"]["rules"])
+
+    def worker(n):
+        for i in range(10):
+            client.post("/api/rules", json={"name": f"r{n}_{i}",
+                                            "pattern": f"*.h{n}-{i}.com",
+                                            "proxy": "XVPN"})
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    rules = body(client.get("/api/rules"))["data"]["rules"]
+    names = [r["name"] for r in rules]
+    assert len(rules) - before == 40, "writes were lost under concurrency"
+    assert len(names) == len(set(names))
+    assert len({r["id"] for r in rules}) == len(rules)

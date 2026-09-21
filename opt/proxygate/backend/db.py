@@ -169,17 +169,30 @@ def get_max_id() -> int:
         return 0
 
 
+# The protocol value mitm_logger writes for a QUIC attempt the gateway
+# blocked. Must match _classify_protocol() in mitm_logger.py and the string
+# the frontend checks in shouldRenderRow().
+QUIC_BLOCKED_PROTOCOL = "QUIC (blocked)"
+
+
 def get_history_page(
     session_floor_id: int,
     before_id: Optional[int] = None,
     limit: int = 50,
     filter_text: str = "",
+    include_quic: bool = True,
 ) -> list[dict]:
     """
     Return up to `limit` rows from the current session (id > session_floor_id),
     strictly older than `before_id` (or the newest page if before_id is None),
     newest first. Used for backward/scroll-up pagination in the traffic panel —
     each call is one "chunk" so the browser never holds the full table in memory.
+
+    include_quic=False drops blocked-QUIC rows in SQL. The client hides them
+    anyway when its "show blocked QUIC" preference is off, but filtering them
+    out here is what makes `limit` mean "rows you will actually see": QUIC
+    attempts can be the overwhelming majority of a session, so a 200-row
+    window could otherwise arrive with only a handful of renderable rows in it.
     """
     try:
         conn = _conn()
@@ -192,6 +205,12 @@ def get_history_page(
             clauses.append("(dest_host LIKE ? OR source_ip LIKE ?)")
             pat = f"%{filter_text}%"
             params.extend([pat, pat])
+        if not include_quic:
+            # IS NOT rather than != so rows with a NULL protocol (written
+            # before the column existed) are kept: "!= NULL" is never true
+            # in SQL and would silently drop them.
+            clauses.append("protocol IS NOT ?")
+            params.append(QUIC_BLOCKED_PROTOCOL)
         where = " AND ".join(clauses)
         params.append(limit)
         rows = conn.execute(

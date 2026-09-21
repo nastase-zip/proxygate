@@ -26,8 +26,38 @@ what a rule means.
 from __future__ import annotations
 
 import fnmatch
+import logging
 import re
 from typing import Optional
+
+_log = logging.getLogger(__name__)
+
+# Nested quantifiers: a quantified group that itself ends in a quantifier,
+# e.g. (a+)+, (a*)*, (a+)*, (\d+){2,}. These are the classic catastrophic
+# backtracking shapes — matching time grows exponentially with input length,
+# so `(a+)+$` against a 40-character hostname runs effectively forever.
+#
+# This matters far more here than in most apps: rules are evaluated inside
+# the mitmproxy addon on EVERY connection, so one such pattern doesn't slow
+# a page down, it wedges the gateway for every device on the hotspot. Python
+# has no regex timeout and no way to bound a match, so the only place to stop
+# it is before it's saved.
+_NESTED_QUANTIFIER_RE = re.compile(r"\([^)]*[+*][^)]*\)\s*[+*]|\([^)]*[+*][^)]*\)\s*\{\d+,")
+
+
+def _log_rejected_pattern(body: str) -> None:
+    """Say why a rule silently stopped matching, once, where anyone looking
+    at the mitmproxy log will see it."""
+    if body in _rejected_logged:
+        return
+    _rejected_logged.add(body)
+    _log.warning("[proxygate] refusing regex %r: nested quantifiers risk "
+                 "catastrophic backtracking, which would stall every "
+                 "connection. This rule will never match.", body)
+
+
+_rejected_logged: set = set()
+
 
 # Compiled regexes are cached: match() runs on every single connection, and
 # re.compile on a cache miss is far more expensive than a dict lookup.
@@ -66,6 +96,16 @@ def compile_pattern(pattern: str) -> Optional[re.Pattern]:
     except re.error:
         compiled = None
 
+    # Second line of defence behind validate(). The API refuses to save a
+    # pattern with nested quantifiers, but rules.yaml can also be edited by
+    # hand — and this runs in the addon, where one such pattern would hang
+    # every connection rather than just one request. Refusing to compile it
+    # degrades to "this rule never matches", which is recoverable; a hung
+    # gateway is not.
+    if compiled is not None and _NESTED_QUANTIFIER_RE.search(body):
+        _log_rejected_pattern(body)
+        compiled = None
+
     if len(_regex_cache) >= _MAX_CACHE:
         _regex_cache.clear()
     _regex_cache[body] = compiled
@@ -96,6 +136,11 @@ def validate(pattern: str) -> Optional[str]:
         re.compile(body, re.IGNORECASE)
     except re.error as e:
         return f"Invalid regex: {e}"
+    if _NESTED_QUANTIFIER_RE.search(body):
+        return ("Regex rejected: nested quantifiers like (a+)+ can take "
+                "exponential time to match and would stall every connection. "
+                "Rewrite without a quantifier directly on a group that "
+                "already contains one.")
     return None
 
 

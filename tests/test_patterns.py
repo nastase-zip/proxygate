@@ -174,3 +174,48 @@ def test_empty_host_never_matches(host):
 def test_whitespace_around_patterns_is_ignored():
     assert pattern_matches("  *.google.com  ", "www.google.com") is True
     assert pattern_matches("  '^google\\.com$'  ", "google.com") is True
+
+
+# ── ReDoS defence ─────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("evil", [
+    "'(a+)+$'",
+    "'(a*)*b'",
+    r"'(\d+)+x'",
+    "'(a+)*'",
+    "'([a-z]+)+$'",
+])
+def test_nested_quantifiers_are_rejected(evil):
+    """
+    Catastrophic backtracking is uniquely dangerous here: rules run inside
+    the addon on every connection, so one such pattern wedges the gateway
+    for every device, not just one request. `'(a+)+$'` against a 60-char
+    host ran for over 60s before this guard.
+    """
+    assert validate(evil) is not None
+    assert "nested quantifiers" in validate(evil).lower()
+
+
+@pytest.mark.parametrize("evil", ["'(a+)+$'", "'([a-z]+)+$'"])
+def test_nested_quantifiers_never_match_at_runtime(evil):
+    """
+    Second line of defence: rules.yaml can be hand-edited past validate(),
+    so the matcher itself must refuse to compile these rather than hang.
+    """
+    import time
+    start = time.perf_counter()
+    assert pattern_matches(evil, "a" * 60 + "!") is False
+    assert time.perf_counter() - start < 1.0, "pattern was not short-circuited"
+
+
+@pytest.mark.parametrize("good", [
+    r"'^cdn\d+\.example\.com$'",
+    r"'^(www\.)?google\.com$'",
+    r"'(googlevideo|ytimg)\.com$'",
+    r"'\d{1,3}'",
+    "'^a+$'",
+    r"'^[a-z]+\.com$'",
+])
+def test_ordinary_regexes_are_not_false_positives(good):
+    """The guard must not reject the patterns people actually write."""
+    assert validate(good) is None

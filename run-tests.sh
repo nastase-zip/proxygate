@@ -54,13 +54,13 @@ fi
 echo "Running ProxyGate tests with $WHICH"
 echo
 
-# -q unless the caller asked for their own verbosity, so the common case is a
-# single summary line rather than 130 dots plus noise.
+# No -v: conftest_report.py already replaces the progress dots with one
+# readable line per test, grouped by area. Adding -v on top would print
+# pytest's raw node id as well, duplicating every line.
+#
+# Pass -q for just the summary, or -v for the raw node ids (handy when you
+# want to copy one back into `pytest` or `--lf`).
 ARGS=("$@")
-case " ${ARGS[*]} " in
-    *" -v "*|*" -q "*|*" -vv "*|*" --verbose "*|*" --quiet "*) ;;
-    *) ARGS+=(-q) ;;
-esac
 
 set +e
 "$PY" -m pytest "${ARGS[@]}"

@@ -171,12 +171,3 @@ Ubuntu or Debian with NetworkManager, a WiFi adapter that supports AP mode, and 
 The upstream proxies are yours to provide. ProxyGate ships pointing at three
 local ones on ports 8893, 8894 and 8895, which is a convention, not a
 requirement: any reachable HTTP or SOCKS proxy works.
-
----
-
-## Going deeper
-
-[ARCHITECTURE.md](ARCHITECTURE.md) has the long version: the exact iptables
-chains, how the upstream proxy connection is spliced into mitmproxy, which
-HTTP status codes are and are not visible without decryption, and a writeup of
-the IPv6 approaches that were tried and rejected.

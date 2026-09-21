@@ -27,3 +27,7 @@ def _stub_mitmproxy() -> None:
 
 
 _stub_mitmproxy()
+
+# Readable console output (plain sentences grouped per area) — see
+# conftest_report.py. PG_PLAIN_TEST_OUTPUT=1 falls back to pytest's format.
+pytest_plugins = ["tests.conftest_report"]
