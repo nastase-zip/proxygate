@@ -17,6 +17,7 @@ import ipaddress
 import logging
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -25,6 +26,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+from backend import devices as devices_mod
+from backend import firewall
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +71,13 @@ CONFIG_PATH  = os.getenv("PROXYGATE_CONFIG", os.path.join(PROJECT_ROOT, "etc/pro
 RULES_PATH   = os.getenv("PROXYGATE_RULES",  os.path.join(PROJECT_ROOT, "etc/proxygate/rules.yaml"))
 
 ADDON_PATH  = os.getenv("PROXYGATE_ADDON", os.path.join(_HERE, "mitm_logger.py"))
+
+# mitmproxy's config dir, holding the CA. Absolute and project-local on
+# purpose: the default (~/.mitmproxy) depends on $HOME at launch, and a
+# different HOME makes mitmproxy generate a brand-new CA, invalidating the
+# certificate already installed and trusted on every device.
+MITM_CONF_DIR = os.getenv("PROXYGATE_MITM_CONFDIR",
+                          os.path.join(PROJECT_ROOT, "var/lib/proxygate/mitmproxy"))
 
 
 # ── Default config ────────────────────────────────────────────────────────────
@@ -111,7 +122,7 @@ rules:
     proxy: XVPN
     enabled: true
 
-default: DIRECT
+default: XVPN
 """
 
 # ── Runtime state — updated after AP comes up ─────────────────────────────────
@@ -490,6 +501,7 @@ def _non_dfs_bssid_for_ssid(iface: str, ssid: str,
         def consider(bssid, freq, ssid_seen, signal):
             nonlocal best_bssid, best_signal, best_band
             nonlocal pref_bssid, pref_signal
+            nonlocal a_bssid, a_signal
             if not bssid or ssid_seen != ssid:
                 return
             band = _band_of_freq(freq)
@@ -508,9 +520,18 @@ def _non_dfs_bssid_for_ssid(iface: str, ssid: str,
             if prefer_band and band == prefer_band:
                 if pref_signal is None or (signal is not None and signal > pref_signal):
                     pref_bssid, pref_signal = bssid, signal
+            # Track the best 5 GHz BSS separately, for the no-preference
+            # default below. 5 GHz is not merely "another band" here: the AP
+            # shares this radio, so landing on 2.4 GHz puts the hotspot on a
+            # crowded 20 MHz channel alongside every neighbouring network,
+            # which is materially worse for clients than an empty 5 GHz one.
+            if band == "a":
+                if a_signal is None or (signal is not None and signal > a_signal):
+                    a_bssid, a_signal = bssid, signal
 
         best_bssid = best_signal = best_band = None
         pref_bssid = pref_signal = None
+        a_bssid = a_signal = None
         cur_bssid = cur_freq = cur_ssid = cur_signal = None
         for line in r.stdout.splitlines():
             line = line.strip()
@@ -530,6 +551,19 @@ def _non_dfs_bssid_for_ssid(iface: str, ssid: str,
         consider(cur_bssid, cur_freq, cur_ssid, cur_signal)
         if pref_bssid:
             return pref_bssid, prefer_band
+        # No band configured: prefer 5 GHz when the SSID offers it, instead of
+        # taking whichever BSS happens to be loudest.
+        #
+        # Signal strength alone made this choice NON-DETERMINISTIC across
+        # restarts — the same SSID's 2.4 GHz and 5 GHz radios trade places as
+        # RSSI fluctuates by a few dBm, so consecutive restarts landed on
+        # band=a/channel=44 and then band=bg/channel=1 with no config change.
+        # Because the AP inherits this channel, the hotspot silently moved
+        # bands between runs and clients that were happy on 5 GHz suddenly
+        # found a congested 2.4 GHz network. 2.4 GHz remains the fallback
+        # when there is genuinely no 5 GHz BSS in range.
+        if a_bssid:
+            return a_bssid, "a"
         return best_bssid, best_band
     except Exception as e:
         log.warning(f"_non_dfs_bssid_for_ssid: {e}")
@@ -652,6 +686,14 @@ def ensure_ipv6_client_link() -> tuple[bool, str, Optional[str], Optional[int]]:
     subprocess.run(["nmcli", "device", "set", IPV6_CLIENT_IF, "managed", "yes"],
                     capture_output=True, timeout=5)
 
+    # Do this immediately after the interface appears and BEFORE we activate
+    # our own profile on it. Any of the user's saved networks pinned to this
+    # interface name becomes eligible the moment it exists, and NM will retry
+    # it every ~25s — each attempt failing with 'ssid-not-found' (the radio is
+    # an AP on a fixed channel and cannot associate elsewhere) and each failure
+    # raising a desktop notification.
+    quiesce_foreign_profiles(IPV6_CLIENT_IF)
+
     # The configured band can only be honoured through the BSS chosen here:
     # the AP shares this radio and therefore this channel, so whatever band
     # the client link lands on is the band the AP gets.
@@ -711,7 +753,85 @@ def ensure_ipv6_client_link() -> tuple[bool, str, Optional[str], Optional[int]]:
     return False, f"joined {ssid!r} but no global IPv6 address appeared within 15s", band, channel
 
 
+def _foreign_connections_bound_to(iface: str) -> list[str]:
+    """
+    Saved NM profiles — not ours — pinned to `iface` by interface-name.
+
+    ProxyGate creates a virtual interface (IPV6_CLIENT_IF) on the shared
+    radio. Any of the user's own saved WiFi profiles that happens to be bound
+    to that interface name, with autoconnect on, becomes eligible the instant
+    the interface appears. NM then tries to activate it, fails, and retries
+    forever — one desktop "network activation failed" popup per attempt.
+
+    It can never succeed: the radio is already an AP on a fixed channel, and a
+    single radio cannot associate elsewhere at the same time. So NM reports
+    'ssid-not-found' even for an SSID that is plainly in range.
+    """
+    found: list[str] = []
+    try:
+        r = subprocess.run(
+            ["nmcli", "-t", "-f", "NAME,UUID", "con", "show"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            if name in (_IPV6_CLIENT_CON, load_config().get("ap_con_name", "proxygate-ap")):
+                continue
+            d = subprocess.run(
+                ["nmcli", "-t", "-f",
+                 "connection.interface-name,connection.autoconnect",
+                 "con", "show", name],
+                capture_output=True, text=True, timeout=10,
+            )
+            fields = dict(
+                l.split(":", 1) for l in d.stdout.splitlines() if ":" in l
+            )
+            if (fields.get("connection.interface-name", "").strip() == iface
+                    and fields.get("connection.autoconnect", "").strip() == "yes"):
+                found.append(name)
+    except Exception:
+        log.debug("could not enumerate NM connections", exc_info=True)
+    return found
+
+
+def quiesce_foreign_profiles(iface: str) -> list[str]:
+    """
+    Stop other saved profiles from fighting over ProxyGate's virtual interface.
+
+    Turns OFF autoconnect for any foreign profile pinned to `iface` — it
+    cannot work while the radio is an AP, and every retry is a failure popup.
+    The profile itself is left intact so the user keeps their network; only
+    the automatic-retry flag is cleared, and only for a profile bound to an
+    interface that exists solely because ProxyGate created it.
+    """
+    disabled: list[str] = []
+    for name in _foreign_connections_bound_to(iface):
+        r = subprocess.run(
+            ["nmcli", "con", "modify", name, "connection.autoconnect", "no"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            disabled.append(name)
+            log.info(
+                "disabled autoconnect for %r: it is pinned to %s, which only "
+                "exists because ProxyGate created it, and cannot associate "
+                "while the radio is hosting the AP (every retry raised a "
+                "'network activation failed' notification)", name, iface)
+    return disabled
+
+
 def teardown_ipv6_client_link() -> None:
+    """
+    Remove the virtual client interface and everything attached to it.
+
+    Deleting the INTERFACE matters as much as the connection: while it exists,
+    any saved profile bound to that name stays eligible for activation, so NM
+    keeps retrying and the user keeps getting failure popups long after
+    ProxyGate has stopped.
+    """
     subprocess.run(["nmcli", "con", "down", _IPV6_CLIENT_CON], capture_output=True, timeout=10)
     subprocess.run(["nmcli", "con", "delete", _IPV6_CLIENT_CON], capture_output=True, timeout=10)
     subprocess.run(["ip", "link", "set", IPV6_CLIENT_IF, "down"], capture_output=True)
@@ -857,224 +977,350 @@ def _blocked_mac_set() -> set[str]:
 
 def apply_iptables() -> tuple[bool, str]:
     """
-    Apply all ProxyGate iptables/ip6tables rules — IPv4 and IPv6 in parallel,
-    both redirected into the same mitmproxy instance (mitm_logger.py's
-    upstream proxy layer handles both address families natively).
+    Apply ProxyGate's packet path.
 
-    All TCP from the hotspot is redirected to mitmproxy, which:
-      - Intercepts and logs HTTP (full request/response).
-      - Logs HTTPS via SNI, passes raw TLS through (no decryption, no CA needed).
-      - Passes other TCP through as raw streams.
-
-    Upstream proxy routing (SOCKS5/HTTP) is handled natively inside
-    mitm_logger.py's asyncio.open_connection patch — every outgoing connect()
-    is tunnelled transparently. No redsocks. No OUTPUT chain (that would break
-    host internet).
-
-    BLOCK mode: all hotspot TCP is dropped in FORWARD; mitmproxy still sees
-    HTTP and kills those flows for logging, but never forwards them.
+    Thin wrapper over backend.firewall, which owns the rules as data and
+    verifies that what it wrote actually landed. This used to be a 404-line
+    function that shelled out to iptables 44 times and checked nothing — which
+    is how rules scoped to a nonexistent interface got installed silently,
+    matching zero packets forever while the gateway reported "connected".
+    firewall.apply() refuses that case up front instead.
     """
-    cfg      = load_config()
-    hi       = HOTSPOT_IF
-    ap_if    = resolve_ap_wifi_if()
-    wan_cfg  = (cfg.get("wan_if") or "").strip()
+    cfg = load_config()
+    ap_if = resolve_ap_wifi_if()
+    wan_cfg = (cfg.get("wan_if") or "").strip()
     # A pinned wan_if is honoured only if it doesn't collide with the AP NIC —
-    # a stale value saved from before a router/adapter swap (or a bad manual
-    # override) must not silently re-create the same-NIC deadlock every time.
-    wan      = wan_cfg if wan_cfg and wan_cfg != ap_if else detect_wan_if() or "eth0"
-    gw     = cfg["hotspot_gw"]
-    sub    = cfg["hotspot_subnet"]
-    mp     = str(cfg["mitm_port"])
+    # a stale value from before an adapter swap must not recreate the
+    # same-NIC deadlock on every connect.
+    wan = wan_cfg if wan_cfg and wan_cfg != ap_if else detect_wan_if() or "eth0"
+
     target = _routing_target()
-    block  = target == "BLOCK"
-
-    def _r(*cmd: str) -> None:
-        subprocess.run(list(cmd), capture_output=True)
-
-    def _must(*cmd: str) -> None:
-        r = subprocess.run(list(cmd), capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"{' '.join(cmd)}\n{r.stderr.strip()}")
+    ruleset = firewall.build(
+        hotspot_if=current_hotspot_if(),
+        wan_if=wan,
+        gateway_ip=cfg["hotspot_gw"],
+        subnet=cfg["hotspot_subnet"],
+        mitm_port=int(cfg["mitm_port"]),
+        block=(target == "BLOCK"),
+        blocked_macs=_blocked_mac_set(),
+    )
 
     try:
-        _must("sysctl", "-qw", "net.ipv4.ip_forward=1")
-        _r   ("sysctl", "-qw", "net.ipv4.conf.all.route_localnet=1")
-        # Increase listen backlog so mitmproxy's accept queue never overflows
-        # under burst traffic (prevents SYN drops that cause UDP fallback leaks).
-        _r   ("sysctl", "-qw", "net.core.somaxconn=4096")
-        _r   ("sysctl", "-qw", "net.ipv4.tcp_max_syn_backlog=4096")
-
-        # IPv6 forwarding — the upstream proxy layer (mitm_logger.py) now speaks
-        # native SOCKS5/HTTP CONNECT for both address families, so IPv6 TCP from
-        # the hotspot is redirected into mitmproxy the same way IPv4 is, instead
-        # of being unconditionally dropped. UDP (including IPv6) is still
-        # dropped below — mitmproxy has no UDP proxy path for either family.
-        _r   ("sysctl", "-qw", "net.ipv6.conf.all.forwarding=1")
-
-        # ── NAT PREROUTING ────────────────────────────────────────────────────
-        _r   ("iptables", "-t", "nat", "-N", "PROXYGATE_REDIRECT")
-        _must("iptables", "-t", "nat", "-F", "PROXYGATE_REDIRECT")
-
-        # Skip traffic originating from the gateway itself
-        for skip in ("127.0.0.1", gw):
-            _must("iptables", "-t", "nat", "-A", "PROXYGATE_REDIRECT",
-                  "-s", skip, "-j", "RETURN")
-        for skip in ("127.0.0.0/8", gw):
-            _must("iptables", "-t", "nat", "-A", "PROXYGATE_REDIRECT",
-                  "-d", skip, "-j", "RETURN")
-
-        # DNS → NM's internal dnsmasq on the gateway
-        for proto in ("udp", "tcp"):
-            _must("iptables", "-t", "nat", "-A", "PROXYGATE_REDIRECT",
-                  "-i", hi, "-p", proto, "--dport", "53",
-                  "-j", "DNAT", "--to-destination", f"{gw}:53")
-
-        if not block:
-            # ALL TCP from hotspot → mitmproxy.
-            # Port 80:  HTTP full interception + logging.
-            # Port 443: HTTPS — SNI logging, raw TLS passthrough.
-            # Other TCP: raw passthrough (logged as TCP flows).
-            # Proxychains handles upstream proxy routing for all of the above.
-            _must("iptables", "-t", "nat", "-A", "PROXYGATE_REDIRECT",
-                  "-i", hi, "-p", "tcp",
-                  "-j", "REDIRECT", "--to-port", mp)
-
-        _r   ("iptables", "-t", "nat", "-D", "PREROUTING", "-j", "PROXYGATE_REDIRECT")
-        _must("iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", "PROXYGATE_REDIRECT")
-
-        # ── NAT POSTROUTING ───────────────────────────────────────────────────
-        _r   ("iptables", "-t", "nat", "-N", "PROXYGATE_MASQ")
-        _must("iptables", "-t", "nat", "-F", "PROXYGATE_MASQ")
-        _must("iptables", "-t", "nat", "-A", "PROXYGATE_MASQ",
-              "-s", sub, "-o", wan, "-j", "MASQUERADE")
-        _r   ("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", "PROXYGATE_MASQ")
-        _must("iptables", "-t", "nat", "-A", "POSTROUTING",  "-j", "PROXYGATE_MASQ")
-
-        # ── FILTER FORWARD ────────────────────────────────────────────────────
-        _r   ("iptables", "-N", "PROXYGATE_FORWARD")
-        _must("iptables", "-F", "PROXYGATE_FORWARD")
-
-        if block:
-            # Drop all forwarded traffic from hotspot (REDIRECT'd TCP goes to
-            # INPUT/mitmproxy and is killed there; FORWARD catches everything else).
-            _must("iptables", "-A", "PROXYGATE_FORWARD",
-                  "-i", hi, "-j", "DROP")
-        else:
-            # Log UDP/443 specifically (almost always a QUIC/HTTP3 attempt)
-            # before it hits the blanket DROP below — purely for traffic-table
-            # visibility (see QuicLogTailer in mitm_logger.py), not a policy
-            # change: the packet is still dropped either way, LOG doesn't
-            # terminate the chain. A distinct prefix keeps this grep-able
-            # without picking up the kernel's routine noise or other dropped
-            # UDP (DNS-over-UDP to a non-GW target, etc.) that we don't want
-            # surfaced as "QUIC" in the UI.
-            _r   ("iptables", "-A", "PROXYGATE_FORWARD",
-                  "-i", hi, "-p", "udp", "--dport", "443",
-                  "-j", "LOG", "--log-prefix", "PGQUIC: ", "--log-level", "6")
-            # Drop ALL UDP from hotspot — UDP cannot go through mitmproxy so
-            # any UDP that reaches FORWARD would bypass the proxy entirely.
-            # This covers QUIC/HTTP3 (UDP 443), DNS-over-UDP to non-GW (already
-            # DNAT'd above), and any other UDP. DNS still works via the DNAT rule.
-            _must("iptables", "-A", "PROXYGATE_FORWARD",
-                  "-i", hi, "-p", "udp", "-j", "DROP")
-            _must("iptables", "-A", "PROXYGATE_FORWARD",
-                  "-i", hi, "-o", wan, "-j", "ACCEPT")
-            _must("iptables", "-A", "PROXYGATE_FORWARD",
-                  "-i", wan, "-o", hi, "-m", "state",
-                  "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-
-        _r   ("iptables", "-D", "FORWARD", "-j", "PROXYGATE_FORWARD")
-        _must("iptables", "-I", "FORWARD", "1", "-j", "PROXYGATE_FORWARD")
-
-        # ── Blocked devices (status dropdown's kick/ban list) ─────────────────
-        # A blocked MAC is dropped in BOTH filter chains: INPUT (so it can't
-        # even reach the gateway itself — DNS, DHCP renewal, the web UI) and
-        # FORWARD (so it gets no internet even if it somehow still has an
-        # IP). `DROP` is only a valid verdict in the filter table — NOT nat,
-        # which is why this isn't done in PROXYGATE_REDIRECT above. Combined
-        # with the immediate `iw station del` kick (services.py's
-        # block_device()), a blocked device is disconnected right away AND
-        # gets nothing even if it immediately reassociates.
-        #
-        # Inserted at FORWARD position 1 AFTER PROXYGATE_FORWARD above (not
-        # before) so it ends up evaluated FIRST — two "-I FORWARD 1" inserts
-        # in sequence means whichever runs second ends up actually at
-        # position 1, pushing the other to position 2.
-        _r   ("iptables", "-N", "PROXYGATE_BLOCKDEV")
-        _must("iptables", "-F", "PROXYGATE_BLOCKDEV")
-        for mac in _blocked_mac_set():
-            # _r, not _must: a single unusable MAC must not abort the entire
-            # iptables setup. blocked_mac_set() already filters malformed
-            # entries, but this is the call that actually decides whether the
-            # gateway comes up at all — failing one DROP rule costs one
-            # device's block, failing the whole chain costs the hotspot.
-            _r("iptables", "-A", "PROXYGATE_BLOCKDEV",
-               "-i", hi, "-m", "mac", "--mac-source", mac, "-j", "DROP")
-        _r   ("iptables", "-D", "INPUT",   "-j", "PROXYGATE_BLOCKDEV")
-        _must("iptables", "-I", "INPUT",   "1", "-j", "PROXYGATE_BLOCKDEV")
-        _r   ("iptables", "-D", "FORWARD", "-j", "PROXYGATE_BLOCKDEV")
-        _must("iptables", "-I", "FORWARD", "1", "-j", "PROXYGATE_BLOCKDEV")
-
-        # ── IPv6 mirror of the above ───────────────────────────────────────────
-        # The hotspot's own DHCP (NM "shared" mode) is IPv4-only, but a device
-        # can still pick up an IPv6 address via SLAAC/router-advertisement if
-        # the WAN side provides one — so IPv6 traffic from the hotspot is a
-        # real possibility even though ProxyGate doesn't manage IPv6 addressing
-        # itself. Matched by interface (not subnet, since there's no IPv6
-        # hotspot_subnet equivalent in config) exactly like PROXYGATE_FORWARD's
-        # interface-based rules above.
-        # No IPv6 DNS DNAT here: ProxyGate's hotspot (NM "shared" mode) only
-        # runs an IPv4 dnsmasq — there is no IPv6 gateway address to redirect
-        # DNS-over-IPv6 to. Devices resolve names over the IPv4 DNS path
-        # (already DNAT'd above) regardless of which family they browse over.
-        _r   ("ip6tables", "-t", "nat", "-N", "PROXYGATE_REDIRECT6")
-        _must("ip6tables", "-t", "nat", "-F", "PROXYGATE_REDIRECT6")
-        _must("ip6tables", "-t", "nat", "-A", "PROXYGATE_REDIRECT6",
-              "-s", "::1", "-j", "RETURN")
-        if not block:
-            _must("ip6tables", "-t", "nat", "-A", "PROXYGATE_REDIRECT6",
-                  "-i", hi, "-p", "tcp",
-                  "-j", "REDIRECT", "--to-port", mp)
-        _r   ("ip6tables", "-t", "nat", "-D", "PREROUTING", "-j", "PROXYGATE_REDIRECT6")
-        _must("ip6tables", "-t", "nat", "-I", "PREROUTING", "1", "-j", "PROXYGATE_REDIRECT6")
-
-        _r   ("ip6tables", "-t", "nat", "-N", "PROXYGATE_MASQ6")
-        _must("ip6tables", "-t", "nat", "-F", "PROXYGATE_MASQ6")
-        _must("ip6tables", "-t", "nat", "-A", "PROXYGATE_MASQ6",
-              "-i", hi, "-o", wan, "-j", "MASQUERADE")
-        _r   ("ip6tables", "-t", "nat", "-D", "POSTROUTING", "-j", "PROXYGATE_MASQ6")
-        _must("ip6tables", "-t", "nat", "-A", "POSTROUTING",  "-j", "PROXYGATE_MASQ6")
-
-        _r   ("ip6tables", "-N", "PROXYGATE_FORWARD6")
-        _must("ip6tables", "-F", "PROXYGATE_FORWARD6")
-        if block:
-            _must("ip6tables", "-A", "PROXYGATE_FORWARD6", "-i", hi, "-j", "DROP")
-        else:
-            # Same UDP-drop rationale as the IPv4 FORWARD chain — mitmproxy has
-            # no UDP proxy path for IPv6 either, so QUIC/HTTP3 must be blocked
-            # here rather than allowed to bypass the proxy over IPv6.
-            _must("ip6tables", "-A", "PROXYGATE_FORWARD6",
-                  "-i", hi, "-p", "udp", "-j", "DROP")
-            _must("ip6tables", "-A", "PROXYGATE_FORWARD6",
-                  "-i", hi, "-o", wan, "-j", "ACCEPT")
-            _must("ip6tables", "-A", "PROXYGATE_FORWARD6",
-                  "-i", wan, "-o", hi, "-m", "state",
-                  "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-        _r   ("ip6tables", "-D", "FORWARD", "-j", "PROXYGATE_FORWARD6")
-        _must("ip6tables", "-I", "FORWARD", "1", "-j", "PROXYGATE_FORWARD6")
-
-        # Kill all existing conntrack entries from the hotspot subnet.
-        # This forces HTTP/2 keep-alive and any pre-existing direct TCP
-        # connections to reconnect, hitting the REDIRECT rule immediately.
-        _r("conntrack", "-D", "-s", sub)
-        _r("conntrack", "-D", "-d", sub)
-
-        return True, f"iptables applied (mode: {target})"
-
-    except RuntimeError as e:
+        firewall.apply(ruleset)
+    except firewall.FirewallError as e:
         return False, str(e)
     except Exception as e:
         return False, f"iptables error: {e}"
+
+    return True, f"iptables applied (mode: {target})"
+
+
+def current_ruleset() -> "firewall.Ruleset":
+    """The packet path this configuration implies — for verification."""
+    cfg = load_config()
+    ap_if = resolve_ap_wifi_if()
+    wan_cfg = (cfg.get("wan_if") or "").strip()
+    wan = wan_cfg if wan_cfg and wan_cfg != ap_if else detect_wan_if() or "eth0"
+    return firewall.build(
+        hotspot_if=current_hotspot_if(),
+        wan_if=wan,
+        gateway_ip=cfg["hotspot_gw"],
+        subnet=cfg["hotspot_subnet"],
+        mitm_port=int(cfg["mitm_port"]),
+        block=(_routing_target() == "BLOCK"),
+        blocked_macs=_blocked_mac_set(),
+    )
+
+
+_registry_lock = threading.Lock()
+_registry: Optional["devices_mod.Registry"] = None
+_registry_iface: Optional[str] = None
+
+
+def device_registry() -> "devices_mod.Registry":
+    """
+    The process-wide device registry — the ONE source of truth for what is on
+    the hotspot.
+
+    Rebuilt when the hotspot interface changes, so it can never keep answering
+    for an interface that no longer exists. Its hostname/client-id memos are
+    deliberately preserved for the life of an interface: a lease file holds
+    only CURRENT leases, and a device must not lose its name the moment its
+    lease rolls.
+    """
+    global _registry, _registry_iface
+    iface = current_hotspot_if()
+    with _registry_lock:
+        if _registry is None or _registry_iface != iface:
+            _registry = devices_mod.Registry(
+                devices_mod.Sources(iface, lease_paths=tuple(_lease_file_candidates())),
+                subnet=load_config().get("hotspot_subnet"),
+                vendor_lookup=_mac_vendor,
+            )
+            _registry_iface = iface
+        return _registry
+
+
+def _migrate_existing_ca() -> None:
+    """
+    Move a CA generated under the old default location into MITM_CONF_DIR.
+
+    Pinning confdir would otherwise be a breaking change: mitmproxy would find
+    the pinned directory empty, mint a fresh CA, and every device that already
+    trusts the old one would start failing TLS — the exact "reinstall the CA
+    again" problem the pin exists to prevent.
+
+    Copies (never moves) so the original stays as a fallback, and never
+    overwrites a CA already present in the pinned directory.
+    """
+    dest_ca = os.path.join(MITM_CONF_DIR, "mitmproxy-ca.pem")
+    if os.path.exists(dest_ca):
+        return
+
+    for home in (os.path.expanduser("~root"), os.path.expanduser("~")):
+        src_dir = os.path.join(home, ".mitmproxy")
+        if not os.path.isfile(os.path.join(src_dir, "mitmproxy-ca.pem")):
+            continue
+        copied = []
+        for name in os.listdir(src_dir):
+            if not name.startswith("mitmproxy-"):
+                continue
+            try:
+                shutil.copy2(os.path.join(src_dir, name),
+                             os.path.join(MITM_CONF_DIR, name))
+                copied.append(name)
+            except Exception:
+                pass
+        if copied:
+            log.info("migrated existing mitmproxy CA from %s — certificates already "
+                     "installed on devices stay valid", src_dir)
+        return
+
+
+# dnsmasq's query log is what turns raw destination IPs into hostnames in the
+# traffic table. NM's shared-mode dnsmasq is configured through drop-ins here.
+DNSMASQ_DROPIN_DIR = "/etc/NetworkManager/dnsmasq-shared.d"
+DNSMASQ_LOG_PATH = "/var/log/proxygate/dnsmasq.log"
+# Rotate at 32 MB. Left unmanaged this grew to 59 MB and climbing — dnsmasq
+# logs every query and every cache hit, so on a busy hotspot it fills a disk
+# with no upper bound and nothing to stop it.
+DNSMASQ_LOG_MAX_BYTES = 32 * 1024 * 1024
+
+
+# Upstream resolvers for the hotspot's dnsmasq.
+#
+# A hand-placed drop-in on this machine pinned a SINGLE upstream with
+# `no-resolv`, and that server later went dark (100% packet loss). With no
+# fallback, every lookup on the hotspot hung until it timed out — which is
+# indistinguishable from "the whole proxy is slow", because nothing resolves
+# until DNS does. Multiple resolvers plus `all-servers` means one dead
+# upstream costs nothing.
+DNS_UPSTREAMS = ("1.1.1.1", "8.8.8.8", "9.9.9.9")
+
+
+def dns_upstream_healthy(server: str, timeout: float = 2.0) -> bool:
+    """Does `server` actually answer a query? Cheap liveness probe."""
+    try:
+        r = subprocess.run(
+            ["dig", "+short", f"+time={int(max(1, timeout))}", "+tries=1",
+             f"@{server}", "github.com"],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def ensure_dns_upstreams() -> tuple[bool, str]:
+    """
+    Own the hotspot's DNS configuration instead of inheriting whatever was
+    left in /etc by hand.
+
+    Replaces any stale ProxyGate drop-in that pins a dead resolver. Writes
+    several upstreams and drops `no-resolv`'s single point of failure, so a
+    resolver going down degrades latency instead of breaking the hotspot
+    entirely.
+    """
+    conf_path = os.path.join(DNSMASQ_DROPIN_DIR, "proxygate-dns.conf")
+    lines = [f"server={s}" for s in DNS_UPSTREAMS]
+    # Query every upstream and take the first answer: a dead resolver then
+    # costs nothing rather than stalling until it times out.
+    lines.append("all-servers")
+    desired = "\n".join(lines) + "\n"
+    try:
+        os.makedirs(DNSMASQ_DROPIN_DIR, exist_ok=True)
+        existing = ""
+        if os.path.isfile(conf_path):
+            with open(conf_path) as f:
+                existing = f.read()
+        if existing.strip() == desired.strip():
+            return True, "dns upstreams already configured"
+        with open(conf_path, "w") as f:
+            f.write(desired)
+        log.info("rewrote dnsmasq upstreams to %s (was: %r)",
+                 ", ".join(DNS_UPSTREAMS), existing.strip().replace("\n", " "))
+        return True, "dns upstreams configured"
+    except Exception as e:
+        return False, f"could not configure dns upstreams: {e}"
+
+
+def _restore_owner(path: str, *, is_dir: bool = False) -> None:
+    """
+    Hand a file/dir this process created back to the user who ran `sudo
+    proxygate`.
+
+    ProxyGate needs root for iptables, the hotspot and NM — but everything it
+    writes lives inside the user's own checkout, so leaving it root-owned locks
+    them out of their own project directory. rules.py already does this for the
+    YAML config; these paths were simply missed, which is why
+    var/lib/proxygate/mitmproxy and var/log/proxygate ended up root:root while
+    every config file beside them is user-owned.
+
+    Best-effort: SUDO_UID is unset when run directly as root, and then there is
+    no invoking user to restore to.
+    """
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if uid is not None and gid is not None:
+        try:
+            os.chown(path, int(uid), int(gid))
+        except OSError:
+            pass
+    try:
+        os.chmod(path, 0o755 if is_dir else 0o644)
+    except OSError:
+        pass
+
+
+def restart_hotspot_dns() -> tuple[bool, str]:
+    """
+    Restart NM's shared-mode dnsmasq so config changes take effect.
+
+    dnsmasq re-reads its conf-dir only on SIGHUP (cache/config) — but a
+    changed `server=` list needs a full restart, and NM owns the process.
+    SIGHUP first (cheap, keeps leases), then fall back to bouncing the
+    connection, which NM restarts dnsmasq for.
+    """
+    pid_file = "/run/nm-dnsmasq-%s.pid" % current_hotspot_if()
+    try:
+        with open(pid_file) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGHUP)
+        return True, f"sent SIGHUP to dnsmasq (pid {pid})"
+    except Exception as e:
+        return False, f"could not signal dnsmasq: {e}"
+
+
+def ensure_dns_logging() -> tuple[bool, str]:
+    """
+    Make sure dnsmasq logs queries where the tailer can read them.
+
+    Without this the traffic table shows bare IPs instead of hostnames. The
+    config previously had to be placed by hand, which meant a fresh install
+    silently had no DNS capture at all — and nothing ever rotated the file.
+    """
+    conf_path = os.path.join(DNSMASQ_DROPIN_DIR, "proxygate-logging.conf")
+    desired = f"log-queries\nlog-facility={DNSMASQ_LOG_PATH}\n"
+    try:
+        os.makedirs(DNSMASQ_DROPIN_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(DNSMASQ_LOG_PATH), exist_ok=True)
+        existing = ""
+        if os.path.isfile(conf_path):
+            with open(conf_path) as f:
+                existing = f.read()
+        if existing.strip() != desired.strip():
+            with open(conf_path, "w") as f:
+                f.write(desired)
+            return True, "dns logging configured (dnsmasq restart required)"
+        return True, "dns logging already configured"
+    except Exception as e:
+        return False, f"could not configure dns logging: {e}"
+
+
+def rotate_dns_log() -> bool:
+    """
+    Truncate the dnsmasq query log once it exceeds DNSMASQ_LOG_MAX_BYTES.
+
+    Truncate in place rather than rename+recreate: dnsmasq holds the file open
+    and will not reopen it without a signal, so renaming would leave it
+    writing to a deleted inode — the log would appear to stop forever. The
+    tailer detects the size going backwards and reseeks.
+    """
+    try:
+        if os.path.getsize(DNSMASQ_LOG_PATH) < DNSMASQ_LOG_MAX_BYTES:
+            return False
+        with open(DNSMASQ_LOG_PATH, "r+") as f:
+            f.truncate(0)
+        log.info("rotated dnsmasq query log (exceeded %d MB)",
+                 DNSMASQ_LOG_MAX_BYTES // (1024 * 1024))
+        return True
+    except Exception:
+        return False
+
+
+def _resync_associated_clients() -> int:
+    """
+    Deauth every associated station so it rejoins cleanly.
+
+    Bringing the gateway up recreates the AP and reprograms NAT beneath any
+    device already on the radio. That device keeps a lease, ARP entry and TCP
+    sessions referencing the PREVIOUS state, so it sits there associated and
+    silent until someone toggles its WiFi by hand. One deauth makes it
+    reassociate, re-DHCP and reopen its connections automatically.
+
+    Blocked devices are skipped — they are meant to stay off.
+    """
+    try:
+        blocked = _blocked_mac_set()
+    except Exception:
+        blocked = set()
+
+    kicked = 0
+    for mac in _associated_stations():
+        if mac in blocked:
+            continue
+        kick_device(mac)
+        kicked += 1
+    if kicked:
+        log.info("resynced %d associated client(s) so they re-DHCP against the "
+                 "new gateway state", kicked)
+    return kicked
+
+
+def iptables_diagnostics() -> dict:
+    """
+    What the gateway actually sees on the wire.
+
+    Delegates the packet-path check to firewall.verify(), which compares the
+    declared ruleset against the kernel and reports counters — the only signal
+    that distinguishes "installed and working" from "installed and matching
+    nothing". Device facts come from the registry so this cannot disagree with
+    what the UI shows.
+    """
+    try:
+        report = firewall.verify(current_ruleset())
+    except Exception as e:
+        report = {"problems": [f"could not read firewall state: {e}"],
+                  "healthy": False, "chains": {}}
+
+    try:
+        reg = device_registry()
+        devices = [d.as_dict() for d in reg.snapshot()]
+        stations = sorted(reg.associated_macs())
+    except Exception as e:
+        devices, stations = [], []
+        report.setdefault("problems", []).append(f"could not read devices: {e}")
+
+    hi = current_hotspot_if()
+    return {
+        **report,
+        "hotspot_if": hi,
+        "hotspot_if_exists": bool(hi) and hi != "ap0"
+                             and os.path.isdir(f"/sys/class/net/{hi}"),
+        "routing_target": _routing_target(),
+        "stations": stations,
+        "devices": devices,
+    }
 
 
 def flush_iptables() -> tuple[bool, str]:
@@ -1086,11 +1332,25 @@ def flush_iptables() -> tuple[bool, str]:
     def _r(*cmd: str) -> None:
         subprocess.run(list(cmd), capture_output=True)
 
-    _r("iptables", "-t", "nat", "-D", "PREROUTING",  "-j", "PROXYGATE_REDIRECT")
-    _r("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", "PROXYGATE_MASQ")
-    _r("iptables",             "-D", "FORWARD",      "-j", "PROXYGATE_FORWARD")
-    _r("iptables",             "-D", "INPUT",        "-j", "PROXYGATE_BLOCKDEV")
-    _r("iptables",             "-D", "FORWARD",      "-j", "PROXYGATE_BLOCKDEV")
+    # Delete jumps REPEATEDLY, not once.
+    #
+    # `iptables -D` removes a single matching rule. A duplicate jump — which
+    # any interrupted connect/reconnect can leave behind — therefore survives
+    # a flush, and the leftover keeps sending packets into a chain this
+    # function is about to delete (or, worse, into a stale chain from an older
+    # version whose rules no longer match the current interface). Looping
+    # until the delete fails is the only way to guarantee none remain.
+    def _r_all(*cmd: str, limit: int = 16) -> None:
+        for _ in range(limit):
+            r = subprocess.run(list(cmd), capture_output=True)
+            if r.returncode != 0:
+                return
+
+    _r_all("iptables", "-t", "nat", "-D", "PREROUTING",  "-j", "PROXYGATE_REDIRECT")
+    _r_all("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", "PROXYGATE_MASQ")
+    _r_all("iptables",             "-D", "FORWARD",      "-j", "PROXYGATE_FORWARD")
+    _r_all("iptables",             "-D", "INPUT",        "-j", "PROXYGATE_BLOCKDEV")
+    _r_all("iptables",             "-D", "FORWARD",      "-j", "PROXYGATE_BLOCKDEV")
 
     # Clean up legacy chains from older versions just in case
     _r("iptables", "-t", "nat", "-D", "OUTPUT", "-j", "PROXYGATE_OUTPUT")
@@ -1105,9 +1365,9 @@ def flush_iptables() -> tuple[bool, str]:
     _r("iptables", "-X", "PROXYGATE_BLOCKDEV")
 
     # IPv6 mirror
-    _r("ip6tables", "-t", "nat", "-D", "PREROUTING",  "-j", "PROXYGATE_REDIRECT6")
-    _r("ip6tables", "-t", "nat", "-D", "POSTROUTING", "-j", "PROXYGATE_MASQ6")
-    _r("ip6tables",             "-D", "FORWARD",      "-j", "PROXYGATE_FORWARD6")
+    _r_all("ip6tables", "-t", "nat", "-D", "PREROUTING",  "-j", "PROXYGATE_REDIRECT6")
+    _r_all("ip6tables", "-t", "nat", "-D", "POSTROUTING", "-j", "PROXYGATE_MASQ6")
+    _r_all("ip6tables",             "-D", "FORWARD",      "-j", "PROXYGATE_FORWARD6")
     for chain in ("PROXYGATE_REDIRECT6", "PROXYGATE_MASQ6"):
         _r("ip6tables", "-t", "nat", "-F", chain)
         _r("ip6tables", "-t", "nat", "-X", chain)
@@ -1116,7 +1376,7 @@ def flush_iptables() -> tuple[bool, str]:
 
     # Clean up the old unconditional-DROP rule from before IPv6 was supported,
     # in case this host still has it from a previous ProxyGate version.
-    _r("ip6tables", "-D", "FORWARD", "-i", HOTSPOT_IF, "-j", "DROP")
+    _r("ip6tables", "-D", "FORWARD", "-i", current_hotspot_if(), "-j", "DROP")
 
     _r("sysctl", "-qw", "net.ipv4.ip_forward=0")
     _r("sysctl", "-qw", "net.ipv6.conf.all.forwarding=0")
@@ -1162,12 +1422,37 @@ class MitmproxyManager:
         if not os.path.isfile(mitmdump_bin):
             mitmdump_bin = shutil.which("mitmdump") or "mitmdump"
 
+        # Pin mitmproxy's config directory, and therefore its CA.
+        #
+        # Without an explicit confdir, mitmproxy uses ~/.mitmproxy — resolved
+        # from $HOME at launch. Whenever that differs (sudo with/without -H,
+        # a systemd unit, a different invoking user) mitmproxy finds no CA
+        # there and silently GENERATES A NEW ONE. Every device that trusted
+        # the old certificate then fails TLS, which presents as "the CA
+        # stopped working and has to be reinstalled" — and reinstalling only
+        # holds until the next launch that resolves HOME differently.
+        #
+        # Pinning it to an absolute path inside the project makes the CA
+        # stable for the life of the install: install it on a device once.
+        os.makedirs(MITM_CONF_DIR, exist_ok=True)
+        _restore_owner(MITM_CONF_DIR, is_dir=True)
+        _migrate_existing_ca()
+        # The CA cert is meant to be downloaded and installed on devices, so it
+        # must stay readable by the user. The PRIVATE key deliberately keeps
+        # its restrictive mode — see below.
+        for name in ("mitmproxy-ca-cert.pem", "mitmproxy-ca-cert.cer",
+                     "mitmproxy-ca-cert.p12"):
+            cert = os.path.join(MITM_CONF_DIR, name)
+            if os.path.isfile(cert):
+                _restore_owner(cert)
+
         cmd = [
             mitmdump_bin,
             "--mode",        "transparent",
             "--listen-port", str(cfg["mitm_port"]),
             "-s",            ADDON_PATH,
             "--ssl-insecure",
+            "--set",         f"confdir={MITM_CONF_DIR}",
             "--set",         "block_global=false",
             "--set",         "connection_strategy=lazy",
             "--set",         "http2=false",
@@ -1362,6 +1647,15 @@ def _connect_worker(on_done) -> None:
             _set_gw(GatewayState.CONNECTING, "IPv6 helper network setup failed — continuing on IPv4 only")
             log.warning(f"IPv6 client link: {ipv6_msg}")
 
+        # Before NM starts the hotspot's dnsmasq, so it picks up query logging
+        # on first launch rather than needing a second connect.
+        ok_dns, dns_msg = ensure_dns_logging()
+        if not ok_dns:
+            log.warning("dns logging: %s", dns_msg)
+        ok_up, up_msg = ensure_dns_upstreams()
+        if not ok_up:
+            log.warning("dns upstreams: %s", up_msg)
+
         _set_gw(GatewayState.CONNECTING, "Creating hotspot connection…")
         ok, msg = create_nm_ap_connection(force_band=force_band, force_channel=force_channel)
         if not ok:
@@ -1386,7 +1680,7 @@ def _connect_worker(on_done) -> None:
             if iface and iface != "ap0":
                 HOTSPOT_IF = iface
             r = subprocess.run(
-                ["ip", "-4", "addr", "show", HOTSPOT_IF],
+                ["ip", "-4", "addr", "show", current_hotspot_if()],
                 capture_output=True, text=True, timeout=5,
             )
             if "inet " in r.stdout:
@@ -1415,6 +1709,24 @@ def _connect_worker(on_done) -> None:
             _set_gw(GatewayState.ERROR, f"mitmproxy: {msg}")
             if on_done: on_done(False, msg)
             return
+
+        # Force every already-associated client to rejoin.
+        #
+        # Bringing the gateway up recreates the AP and reprograms NAT beneath
+        # any device that was already on the radio. Such a device keeps a
+        # lease, ARP entry and TCP sessions that all reference the PREVIOUS
+        # state — so it sits there associated, sending nothing that we route,
+        # until a human toggles its WiFi off and on. That manual step is the
+        # "figure out why there's no traffic" tax, and it is entirely avoidable:
+        # one deauth makes the client reassociate, re-DHCP and reopen its
+        # connections against the gateway that now exists.
+        #
+        # Non-fatal by design: the gateway is already CONNECTED and working at
+        # this point, so a failed kick must never downgrade that.
+        try:
+            _resync_associated_clients()
+        except Exception:
+            log.debug("client resync after connect failed", exc_info=True)
 
         _set_gw(GatewayState.CONNECTED, "Gateway active")
         _start_iptables_watchdog()
@@ -1518,10 +1830,27 @@ def _iptables_watchdog() -> None:
             if state != GatewayState.CONNECTED:
                 return
 
+            rotate_dns_log()
+
             if not _iptables_chain_exists():
                 log.warning("PROXYGATE_REDIRECT chain missing — reapplying iptables.")
                 apply_iptables()
                 continue
+
+            # The chain existing is not the same as it WORKING. Rules scoped to
+            # a stale interface install cleanly and match nothing, forever —
+            # the failure that presented as "the proxy is dead" with no error
+            # anywhere. Verify against the kernel and re-apply if the packet
+            # path is broken.
+            try:
+                report = firewall.verify(current_ruleset())
+                if not report["healthy"]:
+                    log.warning("packet path unhealthy (%s) — reapplying iptables",
+                                "; ".join(report["problems"])[:200])
+                    apply_iptables()
+                    continue
+            except Exception:
+                log.debug("packet-path verification failed", exc_info=True)
 
             cfg = load_config()
             ap_if = resolve_ap_wifi_if()
@@ -1639,23 +1968,13 @@ def get_interface_ip(iface: str) -> str:
 
 
 def get_hotspot_ip() -> str:
-    return get_interface_ip(HOTSPOT_IF)
+    return get_interface_ip(current_hotspot_if())
 
 
 def get_connected_devices() -> int:
-    try:
-        r = subprocess.run(
-            ["iw", "dev", HOTSPOT_IF, "station", "dump"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return r.stdout.count("Station ")
-    except Exception:
-        pass
-    try:
-        with open("/var/lib/misc/dnsmasq.leases") as f:
-            return sum(1 for line in f if line.strip())
-    except Exception:
-        return 0
+    """Devices associated to the radio right now (not leases or ARP, which
+    both persist long after a device leaves and would over-count)."""
+    return device_registry().connected_count()
 
 
 # ── Device identity (IP -> MAC) ───────────────────────────────────────────────
@@ -1745,23 +2064,75 @@ def _lease_file_candidates() -> list[str]:
     return paths
 
 
+def _clean_client_id(client_id: str, mac: str) -> Optional[str]:
+    """
+    A DHCP client-id worth using as a device identity, or None.
+
+    RFC 2132 type-01 client-ids are just `01:` + the hardware address, which
+    is what every device on this hotspot actually sends:
+
+        d2:b6:62:ff:9a:12  ->  01:d2:b6:62:ff:9a:12
+
+    That is the MAC wearing a hat: it rotates exactly when the MAC rotates,
+    so keying identity on it would be no more stable than keying on the MAC.
+    Those are rejected here.
+
+    A client-id that is NOT derived from the MAC (dnsmasq writes these
+    verbatim — e.g. an RFC 4361 DUID, or an operator-configured id) is a
+    genuinely independent identifier that CAN survive a MAC rotation, so it
+    is kept and preferred over the hostname.
+    """
+    cid = (client_id or "").strip().lower()
+    # Whitespace-only must normalize to None, not "" — an empty string would
+    # read as a present-but-blank identity downstream.
+    if not cid or cid == "*":
+        return None
+    mac = mac.strip().lower()
+    # Type-01 ("01:" + MAC), and the same thing with separators stripped.
+    if cid == f"01:{mac}":
+        return None
+    if cid.replace(":", "") == f"01{mac.replace(':', '')}":
+        return None
+    if cid.replace(":", "") == mac.replace(":", ""):
+        return None
+    return cid
+
+
 def _read_leases() -> list[tuple[str, str, Optional[str]]]:
     """
     Parse the hotspot's DHCP lease file into (mac, ip, hostname) tuples.
     dnsmasq writes "*" for a client that sent no hostname; that becomes None.
+
+    Kept at 3-tuples for every existing caller; the client-id is exposed
+    separately by _read_lease_rows() so this signature stays stable.
+    """
+    return [(mac, ip, hostname) for mac, ip, hostname, _cid in _read_lease_rows()]
+
+
+def _read_lease_rows() -> list[tuple[str, str, Optional[str], Optional[str]]]:
+    """
+    Full lease rows: (mac, ip, hostname, client_id).
+
+    dnsmasq lease format is:
+        <expiry> <mac> <ip> <hostname> <client-id>
+    with "*" meaning "the client sent none" for both hostname and client-id.
     """
     for path in _lease_file_candidates():
-        rows: list[tuple[str, str, Optional[str]]] = []
+        rows: list[tuple[str, str, Optional[str], Optional[str]]] = []
         try:
             with open(path) as f:
                 for line in f:
                     parts = line.split()
-                    # format: <expiry> <mac> <ip> <hostname> <client-id>
                     if len(parts) >= 4:
                         mac, ip, hostname = parts[1].lower(), parts[2], parts[3]
-                        rows.append((mac, ip, None if hostname == "*" else hostname))
+                        raw_cid = parts[4] if len(parts) >= 5 else ""
+                        rows.append((
+                            mac, ip,
+                            None if hostname == "*" else hostname,
+                            _clean_client_id(raw_cid, mac),
+                        ))
                     elif len(parts) >= 3:
-                        rows.append((parts[1].lower(), parts[2], None))
+                        rows.append((parts[1].lower(), parts[2], None, None))
         except Exception:
             continue
         if rows:
@@ -1796,6 +2167,71 @@ def current_hotspot_if() -> str:
     return HOTSPOT_IF
 
 
+def _associated_stations() -> set[str]:
+    """
+    MACs currently associated to the hotspot radio, from `iw station dump`.
+
+    This is the ONLY authoritative answer to "is this device connected right
+    now". DHCP leases persist for the whole lease time (an hour here) and ARP
+    rows linger in STALE for minutes-to-hours after a device is gone, so a
+    list built from either keeps showing devices that already left — the
+    "ghost devices" this guards against.
+
+    An empty set is ambiguous: it means either "nothing associated" or "the
+    command failed / iw is missing". Callers must distinguish those, so
+    failure is reported separately by _stations_available().
+    """
+    stations: set[str] = set()
+    iface = current_hotspot_if()
+    if not iface or iface == "ap0":
+        return stations
+    try:
+        r = subprocess.run(
+            ["iw", "dev", iface, "station", "dump"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return stations
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            # "Station aa:bb:cc:dd:ee:ff (on wlp2s0)"
+            if line.startswith("Station "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    stations.add(parts[1].lower())
+    except Exception:
+        pass
+    return stations
+
+
+def _stations_available() -> bool:
+    """
+    True if `iw station dump` actually works on the hotspot interface.
+
+    Used to decide whether an empty station list means "nobody is connected"
+    (trust it, and show nothing) or "we cannot tell" (fall back to leases and
+    ARP rather than wrongly showing an empty device list). Without this, a
+    missing `iw` binary or a down interface would silently empty the UI.
+    """
+    iface = current_hotspot_if()
+    if not iface or iface == "ap0":
+        return False
+    try:
+        r = subprocess.run(
+            ["iw", "dev", iface, "station", "dump"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# Neighbour states that mean "this device is actually on the network right
+# now". PERMANENT is included for a statically-configured neighbour; STALE and
+# friends deliberately are not (see _neighbor_table).
+_LIVE_NEIGH_STATES = {"REACHABLE", "PERMANENT"}
+
+
 def _neighbor_table() -> dict[str, str]:
     """Return {ip: mac} from the kernel's IPv4 neighbor (ARP) table, scoped to
     the hotspot interface only — as a fallback for devices dnsmasq hasn't
@@ -1804,9 +2240,18 @@ def _neighbor_table() -> dict[str, str]:
     unrelated neighbors (e.g. a Docker container's gateway) into the hotspot
     device list."""
     neighbors: dict[str, str] = {}
+    iface = current_hotspot_if()
+    # Never fall back to an unscoped dump. If the hotspot interface can't be
+    # resolved, current_hotspot_if() returns the "ap0" placeholder, and
+    # `ip neigh show dev ap0` errors out — but an empty/!=0 run used to be
+    # swallowed below, and any code path that dropped the `dev` scoping would
+    # dump br-*/enp3s0/docker neighbours straight into the hotspot list.
+    # No interface means no devices, not "every device on the host".
+    if not iface or iface == "ap0":
+        return neighbors
     try:
         r = subprocess.run(
-            ["ip", "-4", "neigh", "show", "dev", current_hotspot_if()],
+            ["ip", "-4", "neigh", "show", "dev", iface],
             capture_output=True, text=True, timeout=5,
         )
         for line in r.stdout.splitlines():
@@ -1820,9 +2265,17 @@ def _neighbor_table() -> dict[str, str]:
             idx = parts.index("lladdr")
             if idx + 1 >= len(parts):
                 continue
-            # FAILED/INCOMPLETE entries are stale: the device is gone but the
-            # kernel keeps the row around for a while.
-            if "FAILED" in parts or "INCOMPLETE" in parts:
+            # Only genuinely-live neighbour states count. The kernel keeps a
+            # row long after a device leaves: it decays
+            # REACHABLE -> STALE -> DELAY -> PROBE -> FAILED, and a device
+            # that has been off the network for hours still sits there as
+            # STALE with a valid lladdr. Treating STALE as present is what
+            # produced "ghost" devices that no longer exist.
+            #
+            # An allowlist, not a denylist: previously only FAILED and
+            # INCOMPLETE were skipped, so every other state (STALE, DELAY,
+            # PROBE, NOARP, and rows with no state word at all) leaked in.
+            if not _LIVE_NEIGH_STATES.intersection(parts):
                 continue
             neighbors[parts[0]] = parts[idx + 1].lower()
     except Exception:
@@ -1839,50 +2292,58 @@ def resolve_mac(ip: str) -> Optional[str]:
     return _neighbor_table().get(ip)
 
 
+# MAC -> last DHCP hostname ever seen, for the lifetime of the process.
+#
+# A lease file only holds CURRENT leases: when a lease expires or is rewritten,
+# the hostname vanishes even though the device is still associated and still
+# the same device. Without this, a device that had a perfectly good name
+# ("iPhone") silently degrades to a bare IP mid-session — the other half of
+# "a device shows only its IP and MAC". Names are only ever added here, never
+# invented: a MAC with no hostname stays nameless.
+_hostname_memo: dict[str, str] = {}
+_hostname_memo_lock = threading.Lock()
+
+
+def _remember_hostnames(rows: list[tuple[str, str, Optional[str]]]) -> None:
+    with _hostname_memo_lock:
+        for mac, _ip, hostname in rows:
+            if hostname:
+                _hostname_memo[mac] = hostname
+
+
+def _recall_hostname(mac: str) -> Optional[str]:
+    with _hostname_memo_lock:
+        return _hostname_memo.get(mac)
+
+
+def _ip_sort_key(ip: Optional[str]) -> tuple:
+    """Sort IPs numerically, not lexically ('192.168.100.9' before '.101')."""
+    if not ip:
+        return (0,)
+    try:
+        return (int(ipaddress.ip_address(ip)),)
+    except ValueError:
+        return (0,)
+
+
 def list_hotspot_devices() -> list[dict]:
     """
-    Return every device currently known on the hotspot subnet, merging
-    dnsmasq leases (has hostname) with the live neighbor table (catches
-    devices dnsmasq hasn't necessarily leased itself, e.g. right after
-    reconnecting). Used by the web UI's device picker for the decrypt
-    allowlist — the source of truth for the allowlist itself is
-    devices.yaml (backend/rules.py), this is just "what's out there".
-
-    Filtered to the configured hotspot_subnet — /var/lib/misc/dnsmasq.leases
-    can be shared by more than just NM's hotspot dnsmasq instance on some
-    setups, and the neighbor table (see _neighbor_table()) is host-wide by
-    nature, so without this a Docker bridge peer or the host's own LAN
-    gateway can otherwise show up looking like a connected hotspot client.
+    Every device known on the hotspot — from the single registry, so the UI,
+    the decrypt gate and the block list can no longer disagree about what
+    exists. See backend/devices.py for why that mattered.
     """
-    try:
-        subnet = ipaddress.ip_network(load_config()["hotspot_subnet"], strict=False)
-    except (ValueError, KeyError):
-        subnet = None
+    return [d.as_dict() for d in device_registry().snapshot()]
 
-    def _in_subnet(ip: str) -> bool:
-        if subnet is None:
-            return True
-        try:
-            return ipaddress.ip_address(ip) in subnet
-        except ValueError:
-            return False
 
-    seen: dict[str, dict] = {}
-    for mac, ip, hostname in _read_leases():
-        if _in_subnet(ip):
-            seen[mac] = {"mac": mac, "ip": ip, "hostname": hostname}
-    for ip, mac in _neighbor_table().items():
-        if _in_subnet(ip):
-            seen.setdefault(mac, {"mac": mac, "ip": ip, "hostname": None})
+def _associated_stations() -> set[str]:
+    """MACs associated to the radio right now."""
+    return device_registry().associated_macs()
 
-    # A device that never sent a DHCP hostname still has a MAC, whose OUI
-    # names the vendor ("Apple", "Samsung") — far easier to pick out of a
-    # list than a bare MAC.
-    for dev in seen.values():
-        dev["vendor"] = _mac_vendor(dev["mac"])
-        dev["display_name"] = dev["hostname"] or dev["vendor"] or dev["ip"]
 
-    return sorted(seen.values(), key=lambda d: d["ip"])
+def resolve_mac(ip: str) -> Optional[str]:
+    """IP -> MAC, resolved live so a just-joined device is identified on its
+    first connection rather than after the next refresh."""
+    return device_registry().mac_for_ip(ip)
 
 
 def kick_device(mac: str) -> None:
@@ -1894,7 +2355,7 @@ def kick_device(mac: str) -> None:
     effort: if the device isn't currently associated, `iw` just reports
     nothing to delete, which is fine, not an error.
     """
-    subprocess.run(["iw", "dev", HOTSPOT_IF, "station", "del", mac],
+    subprocess.run(["iw", "dev", current_hotspot_if(), "station", "del", mac],
                     capture_output=True, timeout=5)
 
 
@@ -1915,6 +2376,25 @@ def block_device(mac: str, label: str = "") -> tuple[bool, str]:
     return ok, msg
 
 
+def _deauth_for_clean_rejoin(mac: str) -> None:
+    """
+    Deauthenticate `mac` so it reassociates from scratch.
+
+    Used when UNBLOCKING, which is counter-intuitive but necessary. While a
+    device is blocked its packets are DROPped in INPUT, so it cannot renew
+    its DHCP lease, cannot resolve DNS, and its TCP sessions die — but it
+    often stays *associated* to the radio. Removing the DROP rule alone
+    leaves it sitting there with a dead lease and half-open sockets that
+    nothing will ever answer, which is why a device could appear "unblocked"
+    and still have no traffic until it was manually toggled off and on.
+
+    Forcing one deauth makes the client rejoin, re-DHCP and re-open its
+    connections immediately, so unblocking takes effect without the user
+    touching the device.
+    """
+    kick_device(mac)
+
+
 def set_device_blocked(mac: str, blocked: bool) -> tuple[bool, str]:
     """
     The on/off toggle: flip enforcement for an EXISTING blocked_devices.yaml
@@ -1930,7 +2410,15 @@ def set_device_blocked(mac: str, blocked: bool) -> tuple[bool, str]:
     from backend.rules import load_blocked_devices, set_blocked_device, reload_blocked_devices
     data = load_blocked_devices()
     data = set_blocked_device(data, mac, blocked)
-    return reload_blocked_devices(data)
+    ok, msg = reload_blocked_devices(data)
+    if ok:
+        # Both directions need a deauth. Blocking: the DROP rule stops new
+        # packets but an already-associated device keeps its radio link, so
+        # kick it off now rather than waiting for it to notice. Unblocking:
+        # see _deauth_for_clean_rejoin — the device must rejoin to get a
+        # working lease back.
+        _deauth_for_clean_rejoin(mac)
+    return ok, msg
 
 
 def delete_blocked_device(mac: str) -> tuple[bool, str]:

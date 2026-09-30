@@ -188,6 +188,41 @@ def restart_mitm():
     return _ok(msg=msg) if ok else _err(msg, 500)
 
 
+@app.route("/api/diagnostics")
+def diagnostics():
+    """
+    What the gateway actually sees on the wire: NAT chains with packet
+    counters, the resolved hotspot interface, associated stations and current
+    leases — plus a plain-language list of anything that looks wrong.
+
+    The packet path can only be read as root, so without this a dead redirect
+    was invisible from outside the process and had to be chased by hand.
+    """
+    return _ok(services.iptables_diagnostics())
+
+
+@app.route("/api/services/repair_dns", methods=["POST"])
+def repair_dns():
+    """
+    Rewrite the hotspot's DNS configuration and restart its resolver.
+
+    Exists because a stale hand-placed drop-in pinned a single upstream that
+    later went dark, and with `no-resolv` there was no fallback — every lookup
+    on the hotspot hung until it timed out, which presents as the entire proxy
+    being slow. This makes the fix applicable without a full reconnect.
+    """
+    _log_request()
+    results = {}
+    ok_up, results["upstreams"] = services.ensure_dns_upstreams()
+    ok_log, results["logging"] = services.ensure_dns_logging()
+    results["restarted"], results["restart_detail"] = services.restart_hotspot_dns()
+    results["upstream_health"] = {
+        s: services.dns_upstream_healthy(s) for s in services.DNS_UPSTREAMS
+    }
+    ok = ok_up and ok_log
+    return _ok(results, "DNS repaired") if ok else _err(str(results), 500)
+
+
 @app.route("/api/services/reapply_rules", methods=["POST"])
 def reapply_rules():
     _log_request()
@@ -610,7 +645,25 @@ def devices_seen():
 
 @app.route("/api/devices/decrypt", methods=["GET"])
 def get_decrypt_devices():
-    return _ok({"data": rules_mod.load_devices()})
+    """
+    The decrypt allowlist, with any rotated randomized MACs re-anchored to the
+    device's current address first.
+
+    Phones rotate their randomized WiFi MAC periodically. Without this the
+    entry keeps pointing at an address the device no longer uses, decryption
+    quietly stops applying, and it presents as "the CA has to be reinstalled
+    every few minutes" — see rules.rebind_rotated_macs.
+    """
+    data = rules_mod.load_devices()
+    try:
+        data, rebinds = rules_mod.rebind_rotated_macs(data, services.list_hotspot_devices())
+        if rebinds:
+            for host, old_mac, new_mac in rebinds:
+                log.info("decrypt entry for %r followed MAC rotation %s -> %s", host, old_mac, new_mac)
+            rules_mod.reload_devices(data)
+    except Exception:
+        log.exception("MAC-rotation rebind failed; serving the stored list unchanged")
+    return _ok({"data": data})
 
 
 @app.route("/api/devices/decrypt", methods=["POST"])
@@ -630,6 +683,21 @@ def add_decrypt_device():
     with rules_mod.rules_transaction():
         data = rules_mod.load_devices()
         data = rules_mod.add_decrypt_device(data, mac, label)
+        # Snapshot every identity signal the device currently presents, not
+        # just one. A randomized MAC rotates, so the decrypt flag has to be
+        # re-matched later from whatever else we know (see
+        # rules.rebind_rotated_macs); recording only a hostname left that
+        # match resting on a single, non-unique field.
+        seen = None
+        for dev in services.list_hotspot_devices():
+            if dev.get("mac", "").lower() == mac.lower():
+                seen = dev
+                break
+        hostname = _str(body, "hostname") or (seen or {}).get("hostname") or ""
+        if hostname:
+            data = rules_mod.remember_hostname(data, mac, hostname)
+        if seen:
+            data = rules_mod.remember_identity(data, mac, seen)
         ok, msg = rules_mod.reload_devices(data)
         return _ok({"data": data}, msg) if ok else _err(msg, 500)
 
@@ -710,7 +778,19 @@ def delete_blocked_device(mac: str):
 
 # mitmdump runs as root (see main.py's geteuid check), so its CA lives under
 # root's home — mitmproxy writes it here unconditionally on first launch.
-MITM_CA_CERT_PATH = os.path.expanduser("~root/.mitmproxy/mitmproxy-ca-cert.pem")
+# The CA mitmproxy actually uses (services.MITM_CONF_DIR is pinned absolutely,
+# so this no longer depends on $HOME — see _migrate_existing_ca). Falls back to
+# the historical ~root location so an install that has not relaunched yet still
+# serves the right certificate.
+MITM_CA_CERT_PATH = os.path.join(services.MITM_CONF_DIR, "mitmproxy-ca-cert.pem")
+_LEGACY_CA_CERT_PATH = os.path.expanduser("~root/.mitmproxy/mitmproxy-ca-cert.pem")
+
+
+def _ca_cert_path() -> str:
+    """Whichever CA file exists, preferring the pinned location."""
+    if os.path.isfile(MITM_CA_CERT_PATH):
+        return MITM_CA_CERT_PATH
+    return _LEGACY_CA_CERT_PATH
 
 
 @app.route("/api/devices/ca-cert")
@@ -720,14 +800,15 @@ def ca_cert():
     required only for devices flagged for decryption above. Devices that
     aren't flagged never need this; their traffic stays raw-TLS passthrough.
     """
-    if not os.path.isfile(MITM_CA_CERT_PATH):
+    path = _ca_cert_path()
+    if not os.path.isfile(path):
         return _err(
             "CA certificate not found yet — start the gateway at least once "
             "so mitmproxy generates it.", 404,
         )
     return send_from_directory(
-        os.path.dirname(MITM_CA_CERT_PATH),
-        os.path.basename(MITM_CA_CERT_PATH),
+        os.path.dirname(path),
+        os.path.basename(path),
         as_attachment=True,
         download_name="proxygate-ca.pem",
         mimetype="application/x-x509-ca-cert",

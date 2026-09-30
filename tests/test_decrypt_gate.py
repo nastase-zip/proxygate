@@ -29,15 +29,19 @@ def test_known_ip_resolves_to_its_mac():
     assert ml._resolve_mac("192.168.100.5") == "aa:bb:cc:dd:ee:ff"
 
 
-def test_unknown_ip_triggers_an_immediate_refresh():
+def test_unknown_ip_resolves_to_none_without_blocking():
     """
-    A device that just joined isn't in the snapshot yet, so its first
-    connections can't be evaluated for decryption. Without this nudge the
-    blind window lasts a full refresh interval, which is exactly when the
-    interesting traffic (app launch, login) happens.
+    A device that just joined must be resolvable on its FIRST connection.
+
+    This used to work by nudging a background refresher and accepting a blind
+    window of up to one refresh interval — during which the device's early
+    traffic (app launch, login) was unidentifiable and silently passed through.
+    The registry now answers synchronously from the lease file, so an unknown
+    IP means genuinely unknown rather than "not cached yet".
+
+    The call must never raise or block: it runs on mitmproxy's event loop.
     """
     assert ml._resolve_mac("192.168.100.99") is None
-    assert ml._mac_refresh_now.is_set()
 
 
 def test_unresolved_ip_is_logged_once_not_per_connection():

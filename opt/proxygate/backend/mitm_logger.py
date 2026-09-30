@@ -95,7 +95,13 @@ DNSMASQ_LOG  = os.getenv("DNSMASQ_LOG",       os.path.join(_PROJECT_ROOT, "var/l
 # the existing DnsLogTailer pattern and needs no subprocess.
 KERN_LOG     = os.getenv("KERN_LOG",          "/var/log/kern.log")
 
-_DNS_REPLY_RE = re.compile(r"\breply\s+(\S+)\s+is\s+(\d{1,3}(?:\.\d{1,3}){3})\b")
+# dnsmasq answers a lookup with either "reply <name> is <ip>" (it queried
+# upstream) or "cached <name> is <ip>" (it already had the answer). Matching
+# only "reply" missed every cached hit — and on a busy hotspot, where the same
+# hostnames repeat constantly, cached answers are the MAJORITY. That left the
+# traffic table showing bare IPs for exactly the domains a device visits most.
+_DNS_REPLY_RE = re.compile(
+    r"\b(?:reply|cached)\s+(\S+)\s+is\s+(\d{1,3}(?:\.\d{1,3}){3})\b")
 _QUIC_LOG_RE  = re.compile(r"PGQUIC:.*\bSRC=(\S+).*\bDST=(\S+).*\bDPT=(\d+)")
 
 
@@ -274,7 +280,7 @@ def _insert_connection(
                     status_code, bytes_transferred, rule_matched, proxy_used, protocol)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     source_ip, dest_host, dest_port, method,
                     status_code, bytes_xfer, rule_matched, proxy_used, protocol,
                 ),
@@ -343,7 +349,7 @@ def _upsert_dns(ip: str, hostname: str) -> None:
             conn.execute(
                 """INSERT OR REPLACE INTO dns_cache (ip, hostname, seen_at)
                    VALUES (?, ?, ?)""",
-                (ip, hostname, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")),
+                (ip, hostname, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
         conn.close()
     except Exception:
@@ -854,35 +860,87 @@ class RulesEngine:
 # renewal — flagging a phone once in the UI keeps working even if its IP on
 # the hotspot subnet changes later in the same session or across reconnects.
 
+def _norm_mac_str(mac: str) -> str:
+    return mac.strip().lower().replace("-", ":")
+
+
+def _is_randomized_mac(mac: str) -> bool:
+    """Locally-administered bit — see rules.is_randomized_mac. Duplicated
+    rather than imported because this addon runs inside mitmproxy, which does
+    not have backend.rules on its path (see the import note at the top)."""
+    try:
+        return bool(int(_norm_mac_str(mac).split(":")[0], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
 class DevicesEngine:
     def __init__(self) -> None:
         self._lock: threading.RLock = threading.RLock()
         self.decrypt_macs: set[str] = set()
+        # Hostnames of decrypt-enabled devices whose MAC is randomized. A
+        # phone that rotates its MAC keeps its DHCP hostname, so this is what
+        # keeps the decrypt flag attached to the device across a rotation —
+        # without it, a rotation silently un-flags the device and looks like
+        # "the CA stopped working / needs reinstalling".
+        self.decrypt_hostnames: set[str] = set()
         self.load()
 
     def load(self) -> None:
         try:
             with open(DEVICES_PATH) as f:
                 data = yaml.safe_load(f) or {}
-            macs = {
-                d["mac"].strip().lower().replace("-", ":")
-                for d in data.get("devices", [])
-                if d.get("decrypt") and d.get("mac")
-            }
+            macs = set()
+            hostnames = set()
+            for d in data.get("devices", []):
+                if not d.get("decrypt") or not d.get("mac"):
+                    continue
+                mac = _norm_mac_str(d["mac"])
+                macs.add(mac)
+                host = (d.get("hostname") or "").strip().lower()
+                if host and _is_randomized_mac(mac):
+                    hostnames.add(host)
             with self._lock:
+                changed = (macs != self.decrypt_macs
+                           or hostnames != self.decrypt_hostnames)
                 self.decrypt_macs = macs
-            _log.info(f"[proxygate] loaded {len(macs)} decrypt-enabled device(s)")
+                self.decrypt_hostnames = hostnames
+            # The decrypt list actually changed — someone flagged or unflagged
+            # a device, or a rotation was re-anchored. Any failure we recorded
+            # before that may no longer apply (the usual case being "the CA is
+            # now installed"), so start clean rather than making the user wait
+            # out a cooldown they cannot see.
+            if changed:
+                cleared = reset_decrypt_breaker()
+                if cleared:
+                    _log.info(f"[proxygate] decrypt list changed — cleared {cleared} "
+                              f"recorded failure(s); next connection retries immediately")
+            _log.info(
+                f"[proxygate] loaded {len(macs)} decrypt-enabled device(s), "
+                f"{len(hostnames)} tracked by hostname across MAC rotation"
+            )
         except FileNotFoundError:
             with self._lock:
                 self.decrypt_macs = set()
+                self.decrypt_hostnames = set()
         except Exception as e:
             _log.error(f"[proxygate] error loading devices: {e}")
 
-    def should_decrypt(self, mac: Optional[str]) -> bool:
-        if not mac:
-            return False
+    def should_decrypt(self, mac: Optional[str], hostname: Optional[str] = None) -> bool:
+        """
+        Decrypt if the MAC is flagged, OR — for a randomized MAC — if the
+        device's current DHCP hostname matches a flagged device.
+
+        The hostname path only ever applies to randomized MACs, so a device
+        with a real burned-in address is never decrypted because it happens to
+        share a hostname with a flagged phone.
+        """
         with self._lock:
-            return mac.strip().lower().replace("-", ":") in self.decrypt_macs
+            if mac and _norm_mac_str(mac) in self.decrypt_macs:
+                return True
+            if hostname and mac and _is_randomized_mac(mac):
+                return hostname.strip().lower() in self.decrypt_hostnames
+            return False
 
 
 # ── Per-(device, domain) decrypt circuit breaker ──────────────────────────────
@@ -909,8 +967,44 @@ class DevicesEngine:
 # Deliberately in-memory only (not persisted) — a restart gives every
 # (mac, domain) pair a fresh start.
 
-_DECRYPT_FAIL_THRESHOLD = 3
+# 2, not 3. Every failed attempt is a broken TLS handshake the CLIENT has to
+# notice and recover from, which is what the user experiences as lag — so the
+# cost of probing a domain that will never accept our CA is paid by the device,
+# not by us. Certificate-pinned apps (TikTok, banking apps, most streaming
+# services) reject on the very first handshake and every one after it, so two
+# strikes is ample evidence.
+_DECRYPT_FAIL_THRESHOLD = 2
+# 60s, not 600s. The breaker exists to stop retry-storms against apps that
+# pin their own certificate and will NEVER accept our CA — it is not meant to
+# be a penalty box a user has to wait out. Ten minutes meant that installing
+# the CA (or re-enabling decryption) appeared to do nothing at all, with no
+# error and nothing to look at, until a timer nobody could see expired. One
+# minute still throttles a doomed pinning app to ~1 attempt/minute while
+# making a genuine fix feel immediate.
+#
+# Any deliberate change to the decrypt list clears the breaker outright (see
+# reset_decrypt_breaker), so the common case — "I just installed the CA and
+# flagged my device" — takes effect on the very next connection.
+# Back to 10 minutes.
+#
+# 60s was a mistake: a pinned app retried ~60x/hour per domain, and a single
+# app touches dozens of domains, so the hotspot filled with doomed handshakes
+# that each cost the phone a failed connection and a retry. That is exactly
+# the "everything lags and barely connects" symptom.
+#
+# The reason 600s felt broken before was NOT the length — it was that nothing
+# cleared it when the situation genuinely changed. That is now handled
+# explicitly by reset_decrypt_breaker(), called whenever the decrypt list
+# changes, so installing a CA still takes effect on the very next connection.
+# A long cooldown and instant recovery are not in tension once the reset is
+# event-driven rather than timer-driven.
 _DECRYPT_COOLDOWN_SECS = 600
+
+# Domains that have NEVER once completed a decrypted handshake are almost
+# certainly certificate-pinned. Re-probing them on a timer is pure cost, so
+# after this many consecutive trips the breaker stops expiring on its own and
+# only a deliberate decrypt-list change reopens it.
+_DECRYPT_PERMANENT_AFTER_TRIPS = 3
 
 _decrypt_breaker: dict[tuple[str, str], dict] = {}
 _decrypt_breaker_lock = threading.Lock()
@@ -929,10 +1023,15 @@ def _domain_blocked_from_decrypt(mac: str, host: str) -> bool:
             return False
         if state["fails"] < _DECRYPT_FAIL_THRESHOLD:
             return False
+        # Repeatedly tripped and never once succeeded: this is a pinned app,
+        # not a trust problem we can fix. Stop probing it on a timer — each
+        # probe costs the CLIENT a broken handshake and a retry. Only an
+        # explicit decrypt-list change reopens it.
+        if state.get("trips", 0) >= _DECRYPT_PERMANENT_AFTER_TRIPS and not state.get("ever_ok"):
+            return True
         if now - state["tripped_at"] >= _DECRYPT_COOLDOWN_SECS:
-            # Cooldown elapsed — allow exactly one more attempt. If it fails
-            # again, note_decrypt_failure() below re-trips the breaker with a
-            # fresh tripped_at, restarting the cooldown.
+            # Cooldown elapsed — allow exactly one more attempt. A failure
+            # re-trips with a fresh timestamp via _note_decrypt_failure().
             state["fails"] = 0
             return False
         return True
@@ -941,16 +1040,51 @@ def _domain_blocked_from_decrypt(mac: str, host: str) -> bool:
 def _note_decrypt_failure(mac: str, host: str) -> None:
     key = _breaker_key(mac, host)
     with _decrypt_breaker_lock:
-        state = _decrypt_breaker.setdefault(key, {"fails": 0, "tripped_at": 0.0})
+        state = _decrypt_breaker.setdefault(
+            key, {"fails": 0, "tripped_at": 0.0, "trips": 0, "ever_ok": False})
         state["fails"] += 1
         if state["fails"] >= _DECRYPT_FAIL_THRESHOLD:
             state["tripped_at"] = time.time()
+            state["trips"] = state.get("trips", 0) + 1
+            if state["trips"] == _DECRYPT_PERMANENT_AFTER_TRIPS and not state["ever_ok"]:
+                _log.info("[proxygate] %s has never accepted our CA on %s — "
+                          "treating it as certificate-pinned and leaving it "
+                          "alone (passthrough) until the decrypt list changes",
+                          host, mac)
 
 
 def _note_decrypt_success(mac: str, host: str) -> None:
+    """A decrypted handshake completed — this domain is NOT pinned."""
     key = _breaker_key(mac, host)
     with _decrypt_breaker_lock:
         _decrypt_breaker.pop(key, None)
+
+
+def reset_decrypt_breaker(mac: Optional[str] = None) -> int:
+    """
+    Forget recorded decrypt failures, so the next connection is tried fresh.
+
+    Called whenever devices.yaml changes — flagging a device, unflagging it,
+    or a MAC rotation being re-anchored. All three mean "the situation the
+    breaker recorded may no longer hold", most importantly because the user
+    has just installed the CA and expects it to work NOW, not after a
+    cooldown. Without this, a device that failed 3 times before the CA was
+    trusted stayed on passthrough for the full cooldown with no indication
+    why.
+
+    `mac` limits the reset to one device; None clears everything. Returns how
+    many entries were dropped, for logging.
+    """
+    with _decrypt_breaker_lock:
+        if mac is None:
+            n = len(_decrypt_breaker)
+            _decrypt_breaker.clear()
+            return n
+        want = mac.strip().lower().replace("-", ":")
+        keys = [k for k in _decrypt_breaker if k[0] == want]
+        for k in keys:
+            _decrypt_breaker.pop(k, None)
+        return len(keys)
 
 
 # IP -> MAC resolution — MUST NEVER BLOCK, because tls_clienthello is a
@@ -978,6 +1112,10 @@ def _note_decrypt_success(mac: str, host: str) -> None:
 # never stalling the proxy's entire event loop again.
 
 _mac_snapshot: dict[str, str] = {}
+# ip -> DHCP hostname, refreshed alongside _mac_snapshot. Needed so the
+# decrypt gate can fall back to hostname when a phone rotates its randomized
+# MAC (see DevicesEngine.should_decrypt).
+_host_snapshot: dict[str, str] = {}
 _mac_snapshot_lock = threading.Lock()
 _MAC_SNAPSHOT_REFRESH_SECS = 3.0
 # Set by _resolve_mac() on a miss so the refresher re-reads immediately
@@ -987,30 +1125,106 @@ _MAC_SNAPSHOT_REFRESH_SECS = 3.0
 _mac_refresh_now = threading.Event()
 _MAC_SNAPSHOT_MIN_SECS = 0.5
 
+# Path to the hotspot's DHCP lease file, discovered once by the refresher
+# (which already resolves it via backend.services) and cached here so the
+# fast-path lookup below is a single plain file read with no subprocess.
+_lease_path_hint: Optional[str] = None
+_lease_path_lock = threading.Lock()
+
+
+def _fast_lease_lookup(ip: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Read (mac, hostname) for `ip` straight from the DHCP lease file.
+
+    This is the "device just joined / just woke up" path. The background
+    snapshot can be up to _MAC_SNAPSHOT_REFRESH_SECS stale, and a device that
+    reconnects after being idle is NOT in it yet — so its first connections
+    resolved to no MAC and silently fell through to passthrough, undecrypted,
+    with nothing in the log to explain why. For a device the user explicitly
+    flagged, those first connections (app launch, login, token refresh) are
+    often the ones that matter most.
+
+    Safe to call from the proxy's event loop: a lease file read is a few
+    microseconds on tmpfs-backed /var/lib, with no subprocess and no ARP
+    round-trip — unlike the inline resolve_mac() this file's header warns
+    about, which shelled out to `ip neigh` and stalled the whole loop.
+    """
+    with _lease_path_lock:
+        path = _lease_path_hint
+    if not path:
+        return None, None
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                # <expiry> <mac> <ip> <hostname> <client-id>
+                if len(parts) >= 3 and parts[2] == ip:
+                    mac = parts[1].lower()
+                    hostname = parts[3] if len(parts) >= 4 and parts[3] != "*" else None
+                    return mac, hostname
+    except Exception:
+        pass
+    return None, None
+
 
 def _resolve_mac(ip: str) -> Optional[str]:
+    """
+    IP -> MAC, via the shared device registry.
+
+    The registry reads the lease file directly on a miss, so a device that has
+    just joined (or woken from idle) is identified on its FIRST connection
+    instead of falling through unrecognised until a background refresh caught
+    up. Those first connections — app launch, login, token refresh — are
+    exactly the ones worth capturing.
+
+    Cheap enough for the proxy's event loop: a lease-file read, no subprocess
+    and no ARP round-trip. (The old inline resolve_mac() shelled out to
+    `ip neigh` and stalled the whole loop, which is what the snapshot
+    machinery existed to avoid.)
+    """
     with _mac_snapshot_lock:
         mac = _mac_snapshot.get(ip)
-    if mac is None:
-        # A device that has only just joined isn't in the snapshot yet, so
-        # its first connections resolve to no MAC and silently fall through
-        # to passthrough — even when it IS on the decrypt allowlist. Those
-        # early connections (app launch, login) are often the ones worth
-        # capturing, so ask the refresher to re-read now rather than waiting
-        # out the rest of the poll interval.
-        #
-        # Only a nudge: this stays non-blocking (setting an event, no I/O on
-        # the proxy's event loop), so this connection still goes through as
-        # passthrough. It shortens the blind window for the ones behind it
-        # from up to _MAC_SNAPSHOT_REFRESH_SECS to roughly one refresh.
-        _mac_refresh_now.set()
-        _note_unresolved_mac(ip)
-    return mac
+    if mac:
+        return mac
+    dev = _registry_lookup(ip)
+    if dev and dev.mac:
+        with _mac_snapshot_lock:
+            _mac_snapshot[ip] = dev.mac
+            if dev.hostname:
+                _host_snapshot[ip] = dev.hostname
+        return dev.mac
+    _note_unresolved_mac(ip)
+    return None
+
+
+def _resolve_hostname(ip: str) -> Optional[str]:
+    """DHCP hostname for an IP — the anchor that re-identifies a device after
+    it rotates its randomized MAC."""
+    with _mac_snapshot_lock:
+        host = _host_snapshot.get(ip)
+    if host:
+        return host
+    dev = _registry_lookup(ip)
+    if dev and dev.hostname:
+        with _mac_snapshot_lock:
+            _host_snapshot[ip] = dev.hostname
+        return dev.hostname
+    return None
+
+
+def _registry_lookup(ip: str):
+    """Ask the shared registry about `ip`, never raising into the event loop."""
+    try:
+        from backend.services import device_registry
+        return device_registry().by_ip(ip)
+    except Exception:
+        _log.debug("registry lookup failed for %s", ip, exc_info=True)
+        return None
 
 
 # IPs seen with no MAC, logged once each. Without this the only symptom of a
-# device never being decrypted is silence — no error, no row, nothing to
-# distinguish "not on the allowlist" from "we couldn't identify it".
+# device never being decrypted is silence — nothing distinguishes "not on the
+# allowlist" from "we couldn't identify it".
 _unresolved_macs: set = set()
 _unresolved_lock = threading.Lock()
 
@@ -1021,14 +1235,23 @@ def _note_unresolved_mac(ip: str) -> None:
             return
         _unresolved_macs.add(ip)
     _log.info("[proxygate] no MAC known for %s yet — decryption cannot be "
-              "evaluated for it until the device table refreshes. If this "
-              "persists, the device may not have a DHCP lease or ARP entry "
-              "on the hotspot interface.", ip)
+              "evaluated for it. If this persists, the device may have no "
+              "DHCP lease or ARP entry on the hotspot interface.", ip)
 
 
 class MacSnapshotRefresher:
-    """Background-only IP->MAC table refresh — see _resolve_mac's docstring
-    for why this can never run inline from tls_clienthello."""
+    """
+    Keeps the event-loop-visible IP->MAC/hostname snapshot warm.
+
+    The registry is already the source of truth and caches its own lease
+    reads, so this exists only to pre-populate the snapshot in the background.
+    That keeps `_resolve_mac()` a pure dict lookup for devices that were
+    already present, while a genuinely new device still resolves on its first
+    connection via the registry's own fast path.
+
+    Everything slow happens HERE, on this thread — never on the proxy's loop.
+    """
+
     def __init__(self) -> None:
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="mac-snapshot-refresher"
@@ -1040,25 +1263,24 @@ class MacSnapshotRefresher:
     def _run(self) -> None:
         while True:
             try:
-                from backend.services import list_hotspot_devices
-                devices = list_hotspot_devices()
-                snapshot = {d["ip"]: d["mac"] for d in devices if d.get("ip") and d.get("mac")}
+                from backend.services import device_registry
+                registry = device_registry()
+                # Force a fresh read: this thread is allowed to be slow.
+                registry.invalidate()
+                devices = registry.snapshot()
+                snapshot = {d.ip: d.mac for d in devices if d.ip and d.mac}
+                hosts = {d.ip: d.hostname for d in devices if d.ip and d.hostname}
                 with _mac_snapshot_lock:
                     _mac_snapshot.clear()
                     _mac_snapshot.update(snapshot)
+                    _host_snapshot.clear()
+                    _host_snapshot.update(hosts)
             except Exception:
-                # Logged at debug, not silently swallowed to nothing — an
-                # import/subprocess failure here means MAC resolution goes
-                # stale (old snapshot keeps serving) rather than never
-                # working at all, which is a much softer failure mode than
-                # the old inline version's "decryption silently never
-                # engages for ANY device" when resolution broke.
+                # Debug, not silence: a failure here means resolution goes
+                # stale (the previous snapshot keeps serving) rather than
+                # breaking outright.
                 _log.debug(f"[proxygate] MacSnapshotRefresher: {traceback.format_exc()}")
 
-            # Wake early when _resolve_mac() saw an IP it couldn't identify
-            # (a device that just joined), so its next connections can be
-            # evaluated for decryption instead of waiting out the interval.
-            # The floor keeps a stream of unknown IPs from spinning this.
             if _mac_refresh_now.wait(timeout=_MAC_SNAPSHOT_REFRESH_SECS):
                 _mac_refresh_now.clear()
                 time.sleep(_MAC_SNAPSHOT_MIN_SECS)
@@ -1119,7 +1341,70 @@ class RulesWatcher:
 
 # ── dnsmasq log tailer ────────────────────────────────────────────────────────
 
+def _dnsmasq_log_candidates() -> list[str]:
+    """
+    Where the hotspot's dnsmasq actually writes its query log, best first.
+
+    This was a silent, total failure: the tailer waited on
+    <project>/var/log/proxygate/dnsmasq.log while the dnsmasq drop-in
+    (/etc/NetworkManager/dnsmasq-shared.d/proxygate-logging.conf) writes to
+    the ABSOLUTE /var/log/proxygate/dnsmasq.log. Two different files. The
+    tailer blocked forever on a path that never appeared, so DNS was never
+    captured in real time — while 59 MB of queries piled up in the real file.
+
+    Rather than hardcode one path again, read log-facility straight from the
+    drop-in that configures dnsmasq, and fall back to the known locations.
+    """
+    paths: list[str] = []
+
+    conf_dir = "/etc/NetworkManager/dnsmasq-shared.d"
+    try:
+        for name in sorted(os.listdir(conf_dir)):
+            try:
+                with open(os.path.join(conf_dir, name)) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line.startswith("log-facility="):
+                            value = line.split("=", 1)[1].strip()
+                            if value and value not in paths:
+                                paths.append(value)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    for fallback in ("/var/log/proxygate/dnsmasq.log", DNSMASQ_LOG):
+        if fallback not in paths:
+            paths.append(fallback)
+    return paths
+
+
+def _resolve_dnsmasq_log() -> Optional[str]:
+    """The first candidate that exists AND is readable by this process."""
+    for path in _dnsmasq_log_candidates():
+        try:
+            with open(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
 class DnsLogTailer:
+    """
+    Streams dnsmasq's query log so hostnames appear the moment a device
+    resolves them — the difference between a traffic table that fills in
+    real time and one that only ever shows raw IPs.
+    """
+
+    # How long to wait before re-checking for a log file that isn't there yet.
+    _DISCOVER_INTERVAL = 2.0
+    # Idle poll between reads. Small enough to feel instantaneous, large
+    # enough not to spin a core on an idle hotspot.
+    _IDLE_POLL = 0.1
+    # How often to check whether the file was rotated out from under us.
+    _ROTATE_CHECK_SECS = 5.0
+
     def __init__(self) -> None:
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="dns-log-tailer"
@@ -1133,21 +1418,62 @@ class DnsLogTailer:
             try:
                 self._tail()
             except Exception:
+                _log.debug("[proxygate] DnsLogTailer: %s", traceback.format_exc())
                 time.sleep(5)
 
     def _tail(self) -> None:
-        while not os.path.exists(DNSMASQ_LOG):
-            time.sleep(2)
-        with open(DNSMASQ_LOG, "r") as fh:
+        path = _resolve_dnsmasq_log()
+        if not path:
+            # Say so once, rather than blocking forever in silence the way
+            # this used to when the path was wrong.
+            if not getattr(self, "_warned", False):
+                self._warned = True
+                _log.warning(
+                    "[proxygate] no readable dnsmasq query log found (tried %s) — "
+                    "hostnames will be missing from the traffic table until one "
+                    "appears", ", ".join(_dnsmasq_log_candidates()))
+            time.sleep(self._DISCOVER_INTERVAL)
+            return
+
+        self._warned = False
+        _log.info("[proxygate] tailing dnsmasq query log at %s", path)
+
+        with open(path, "r", errors="replace") as fh:
             fh.seek(0, 2)
+            inode = os.fstat(fh.fileno()).st_ino
+            last_rotate_check = time.monotonic()
+
             while True:
                 line = fh.readline()
-                if not line:
-                    time.sleep(0.05)
+                if line:
+                    m = _DNS_REPLY_RE.search(line)
+                    if m:
+                        _upsert_dns(m.group(2), m.group(1))
                     continue
-                m = _DNS_REPLY_RE.search(line)
-                if m:
-                    _upsert_dns(m.group(2), m.group(1))
+
+                time.sleep(self._IDLE_POLL)
+
+                # Two ways the log can go out from under us, both of which
+                # otherwise look exactly like "DNS capture silently stopped":
+                #
+                #   replaced — a new inode; we'd read a deleted file forever.
+                #   truncated — rotation in place (what rotate_dns_log does,
+                #     because dnsmasq holds the fd open and would keep writing
+                #     to a deleted inode if we renamed). Our offset is then
+                #     past EOF and readline() never returns anything again.
+                now = time.monotonic()
+                if now - last_rotate_check >= self._ROTATE_CHECK_SECS:
+                    last_rotate_check = now
+                    try:
+                        st = os.stat(path)
+                        if st.st_ino != inode:
+                            _log.info("[proxygate] dnsmasq log replaced — reopening")
+                            return
+                        if st.st_size < fh.tell():
+                            _log.info("[proxygate] dnsmasq log truncated — reseeking")
+                            fh.seek(0)
+                    except FileNotFoundError:
+                        return
 
 
 # ── QUIC-blocked-attempt log tailer ───────────────────────────────────────────
@@ -1277,7 +1603,11 @@ class ProxyGateAddon:
             # hitting the same domain is unaffected; see
             # _domain_blocked_from_decrypt's docstring.
             mac = _resolve_mac(src_ip)
-            decrypt = self.devices.should_decrypt(mac) and mac and not _domain_blocked_from_decrypt(mac, display_host)
+            # Hostname is passed too so a phone that has rotated its
+            # randomized MAC is still recognized as the flagged device.
+            host_name = _resolve_hostname(src_ip)
+            decrypt = (self.devices.should_decrypt(mac, host_name) and mac
+                       and not _domain_blocked_from_decrypt(mac, display_host))
             data.ignore_connection = not decrypt
             if decrypt:
                 print(f"[proxygate] decrypting {src_ip} (mac={mac}) → {connect_host}:{dest_port}", flush=True)

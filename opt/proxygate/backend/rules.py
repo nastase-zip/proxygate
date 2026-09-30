@@ -397,6 +397,245 @@ def decrypt_mac_set(data: dict) -> set[str]:
     return {_norm_mac(d["mac"]) for d in data.get("devices", []) if d.get("decrypt") and d.get("mac")}
 
 
+# ── Identity across MAC rotation ──────────────────────────────────────────────
+#
+# Phones randomize their WiFi MAC per network (iOS "Private Wi-Fi Address",
+# Android "randomized MAC") and ROTATE it periodically — not just once at
+# first join. A decrypt flag keyed purely on MAC therefore detaches from the
+# phone it was set for the moment the phone rotates, which looks exactly like
+# "the CA stopped working and has to be reinstalled": the CA is still trusted
+# on the device, but ProxyGate no longer recognizes the device as one it
+# should decrypt, or (worse) still decrypts under a stale identity the phone
+# never trusted a certificate for.
+#
+# The DHCP hostname is the one identifier that DOES survive rotation — a
+# phone keeps sending the same hostname ("iPhone", "Pixel-7") across MAC
+# changes. It is not globally unique, but within a single hotspot it is a
+# far better anchor than an address designed to change.
+
+
+def is_randomized_mac(mac: str) -> bool:
+    """
+    True for a locally-administered (randomized) MAC — the second-least
+    significant bit of the first octet. These rotate, so a flag keyed on one
+    is inherently temporary; see _DEFAULT_DEVICES' note above.
+    """
+    if not isinstance(mac, str):
+        return False
+    parts = _norm_mac(mac).split(":")
+    if len(parts) < 1:
+        return False
+    try:
+        return bool(int(parts[0], 16) & 0x02)
+    except ValueError:
+        return False
+
+
+def decrypt_hostname_set(data: dict) -> set[str]:
+    """
+    Lower-cased DHCP hostnames flagged for decryption.
+
+    Only hostnames recorded against a randomized MAC are returned: a device
+    with a stable burned-in MAC needs no hostname fallback, and matching on
+    hostname there would widen the decrypt set for no benefit.
+    """
+    out: set[str] = set()
+    for d in data.get("devices", []):
+        if not d.get("decrypt"):
+            continue
+        host = (d.get("hostname") or "").strip().lower()
+        if host and is_randomized_mac(d.get("mac", "")):
+            out.add(host)
+    return out
+
+
+def remember_hostname(data: dict, mac: str, hostname: str) -> dict:
+    """
+    Record the DHCP hostname alongside an existing decrypt entry, so the flag
+    can be re-anchored after the device rotates its MAC. No-op when the
+    hostname is empty or the MAC is not in the list.
+    """
+    mac = _norm_mac(mac)
+    hostname = (hostname or "").strip()
+    if not hostname:
+        return data
+    for d in data.get("devices", []):
+        if _norm_mac(d.get("mac", "")) == mac:
+            d["hostname"] = hostname
+    return data
+
+
+# Identity signals, and what each is worth.
+#
+# No single signal is sufficient: a randomized MAC rotates by design, a
+# hostname is not unique, an OUI prefix is shared by millions of devices, and
+# an IP is reassigned by DHCP. Scoring them TOGETHER is what makes a match
+# trustworthy — the old single-anchor version could be fooled by any one
+# signal being absent or coincidentally shared.
+#
+# Weights are ordered by how hard each signal is to collide with by accident:
+_W_CLIENT_ID   = 100   # independent DHCP id — conclusive on its own
+_W_HOSTNAME    = 60    # stable across rotation; not unique, so the margin
+                       # check below is what stops two "iPhone"s merging
+_W_OUI_PREFIX  = 15    # randomized MACs keep a per-vendor prefix on some stacks
+_W_SAME_IP     = 25    # DHCP usually re-offers the same IP to the same device
+_W_VENDOR      = 10    # weak corroboration only
+
+# A candidate must clear this to be accepted at all. Set so that a hostname
+# match (60) or a client-id (100) qualifies, but no combination of purely
+# circumstantial signals does: same-IP + mac-prefix + vendor = 50, which is
+# deliberately NOT enough to move a decrypt flag on its own.
+_REBIND_THRESHOLD = 60
+
+# A match must also beat the runner-up by this margin. Two devices scoring
+# near-identically means the evidence does not distinguish them, and picking
+# either would be a coin flip that silently moves someone's decrypt flag.
+# This is what makes a shared hostname ambiguous rather than a race.
+_REBIND_MARGIN = 25
+
+
+def _identity_score(entry: dict, device: dict) -> tuple[int, list[str]]:
+    """
+    Score how strongly a stored entry and a present device look like the same
+    physical device. Returns (score, reasons) — reasons are logged so a
+    rebind is explainable rather than magic.
+    """
+    score = 0
+    reasons: list[str] = []
+
+    e_cid = (entry.get("client_id") or "").strip().lower()
+    d_cid = (device.get("client_id") or "").strip().lower()
+    if e_cid and d_cid:
+        if e_cid == d_cid:
+            score += _W_CLIENT_ID
+            reasons.append("client-id")
+        else:
+            # Two independent client-ids that DISAGREE is positive evidence of
+            # different devices, not merely absent evidence.
+            return 0, ["client-id mismatch"]
+
+    e_host = (entry.get("hostname") or "").strip().lower()
+    d_host = (device.get("hostname") or "").strip().lower()
+    if e_host and d_host and e_host == d_host:
+        score += _W_HOSTNAME
+        reasons.append("hostname")
+
+    # Several randomization schemes keep a stable per-network prefix, so a
+    # shared first-three-octet prefix between two randomized MACs is mild
+    # corroboration. Worthless on its own, useful alongside a hostname.
+    e_mac = _norm_mac(entry.get("mac", ""))
+    d_mac = _norm_mac(device.get("mac", ""))
+    if e_mac and d_mac and e_mac[:8] == d_mac[:8]:
+        score += _W_OUI_PREFIX
+        reasons.append("mac-prefix")
+
+    e_ip = (entry.get("ip") or "").strip()
+    d_ip = (device.get("ip") or "").strip()
+    if e_ip and d_ip and e_ip == d_ip:
+        score += _W_SAME_IP
+        reasons.append("same-ip")
+
+    e_vendor = (entry.get("vendor") or "").strip().lower()
+    d_vendor = (device.get("vendor") or "").strip().lower()
+    if e_vendor and d_vendor and e_vendor == d_vendor:
+        score += _W_VENDOR
+        reasons.append("vendor")
+
+    return score, reasons
+
+
+def remember_identity(data: dict, mac: str, device: dict) -> dict:
+    """
+    Snapshot a device's current identity signals onto its entry, so a later
+    rotation can be matched on all of them rather than on a hostname alone.
+    Only ever records what the device actually presented; absent fields are
+    left untouched rather than blanked.
+    """
+    mac = _norm_mac(mac)
+    for d in data.get("devices", []):
+        if _norm_mac(d.get("mac", "")) != mac:
+            continue
+        for key in ("client_id", "ip", "vendor"):
+            value = device.get(key)
+            if value:
+                d[key] = value
+        if device.get("hostname"):
+            d["hostname"] = device["hostname"]
+    return data
+
+
+def rebind_rotated_macs(data: dict, current: list[dict]) -> tuple[dict, list[tuple[str, str, str]]]:
+    """
+    Re-point decrypt entries at a device's CURRENT randomized MAC, using every
+    identity signal available rather than any single one.
+
+    `current` is list_hotspot_devices()-shaped. For each decrypt entry whose
+    recorded randomized MAC is no longer present, every present randomized-MAC
+    device is scored against it (see _identity_score). The best candidate wins
+    only if it clears _REBIND_THRESHOLD and beats the runner-up by
+    _REBIND_MARGIN, so an ambiguous field rebinds nothing.
+
+    Returns (data, rebinds) with rebinds as [(label, old_mac, new_mac)].
+
+    Will not rebind when:
+      * the recorded MAC is still present (nothing rotated),
+      * the recorded MAC is a real burned-in OUI address (those do not rotate),
+      * no candidate clears the threshold, or two are too close to separate,
+      * the winning MAC is already claimed by another entry.
+    """
+    present_macs = {_norm_mac(d.get("mac", "")) for d in current if d.get("mac")}
+    candidates = [
+        d for d in current
+        if d.get("mac") and is_randomized_mac(_norm_mac(d.get("mac", "")))
+    ]
+
+    rebinds: list[tuple[str, str, str]] = []
+    for entry in data.get("devices", []):
+        old_mac = _norm_mac(entry.get("mac", ""))
+        if not old_mac or not is_randomized_mac(old_mac):
+            continue
+        if old_mac in present_macs:
+            continue
+
+        claimed = {_norm_mac(e.get("mac", "")) for e in data.get("devices", []) if e is not entry}
+
+        scored: list[tuple[int, list[str], dict]] = []
+        for dev in candidates:
+            new_mac = _norm_mac(dev.get("mac", ""))
+            if not new_mac or new_mac == old_mac or new_mac in claimed:
+                continue
+            score, reasons = _identity_score(entry, dev)
+            if score > 0:
+                scored.append((score, reasons, dev))
+
+        if not scored:
+            continue
+        scored.sort(key=lambda t: t[0], reverse=True)
+        best_score, best_reasons, best_dev = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else 0
+
+        if best_score < _REBIND_THRESHOLD:
+            continue
+        if best_score - runner_up < _REBIND_MARGIN:
+            continue
+
+        new_mac = _norm_mac(best_dev["mac"])
+        entry["mac"] = new_mac
+        # Keep the entry's anchors fresh so the NEXT rotation has more to
+        # match on than the one just used.
+        if best_dev.get("hostname"):
+            entry["hostname"] = best_dev["hostname"]
+        if best_dev.get("client_id"):
+            entry["client_id"] = best_dev["client_id"]
+        if best_dev.get("ip"):
+            entry["ip"] = best_dev["ip"]
+        if best_dev.get("vendor"):
+            entry["vendor"] = best_dev["vendor"]
+        label = (entry.get("hostname") or entry.get("label") or new_mac).strip().lower()
+        rebinds.append((label, old_mac, new_mac))
+    return data, rebinds
+
+
 # ── Blocked devices (kicked from the hotspot, by MAC) ─────────────────────────
 #
 # A completely separate concept from decrypt opt-in above — this is a

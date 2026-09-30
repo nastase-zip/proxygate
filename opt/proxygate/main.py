@@ -54,6 +54,13 @@ def _setup_logging() -> None:
         from backend.rules import _restore_owner
         log_existed = os.path.isdir(log_dir)
         os.makedirs(log_dir, exist_ok=True)
+        # Created by root (the app needs it), but it lives in the user's
+        # checkout — hand it back so they can read their own logs without sudo.
+        try:
+            from backend.services import _restore_owner
+            _restore_owner(log_dir, is_dir=True)
+        except Exception:
+            pass
         if not log_existed:
             _restore_owner(log_dir, is_dir=True)
         log_file = os.path.join(log_dir, "web.log")
