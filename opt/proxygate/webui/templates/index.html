@@ -162,7 +162,7 @@
           <button id="fd-close" class="icon-btn" title="Close detail" aria-label="Close detail">✕</button>
         </div>
         <div id="fd-empty" class="dim-label hidden">
-          No captured detail for this connection. It was raw-TLS passthrough (not decrypted) or not an HTTP/S flow, so there's nothing beyond what's already in the table row.
+          No request/response detail was captured for this connection.
         </div>
         <!-- Key facts pulled out of the headers so the common questions
              (what type, how big, what server) are answered without reading
@@ -228,7 +228,7 @@
   <label class="dim-label">Name</label>
   <input id="af-name" type="text">
   <label class="dim-label">Patterns (one per line or ;)</label>
-  <textarea id="af-pattern" rows="3" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
+  <textarea id="af-pattern" class="pattern-input" rows="3" wrap="off" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
   <p class="modal-note modal-note-error hidden" id="af-pattern-error">
     <i class="fa-solid fa-circle-info"></i>
     <span></span>
@@ -253,7 +253,7 @@
   <label class="dim-label">Name</label>
   <input id="ef-name" type="text">
   <label class="dim-label">Patterns (one per line or ;)</label>
-  <textarea id="ef-pattern" rows="3" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
+  <textarea id="ef-pattern" class="pattern-input" rows="3" wrap="off" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="*.google.com&#10;&#39;^(www\.)?google\.com$&#39;"></textarea>
   <p class="modal-note modal-note-error hidden" id="ef-pattern-error">
     <i class="fa-solid fa-circle-info"></i>
     <span></span>

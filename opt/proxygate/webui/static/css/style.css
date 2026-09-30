@@ -1042,6 +1042,9 @@ body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-sel
   font-size: 12px; font-weight: 600; letter-spacing: 0.2px;
   color: var(--text);
 }
+/* The rule dialogs hold long regex patterns, so they get more room than the
+   340px default. Still capped by .modal's max-width on small screens. */
+#modal-add-rule, #modal-edit-rule { width: 440px; }
 .modal-close {
   width: 20px; height: 20px; flex-shrink: 0; padding: 0;
   display: flex; align-items: center; justify-content: center;
@@ -1060,6 +1063,21 @@ body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-sel
 .modal input[type="password"],
 .modal select,
 .modal textarea { margin-bottom: 0; padding: 6px 8px; border-radius: 4px; }
+/* Rule patterns: one line on screen is one pattern. Soft-wrapping made a long
+   regex look like two lines, indistinguishable from a real line break
+   (which is a pattern separator), so a wrapped paste couldn't be spotted.
+   Long lines scroll sideways instead; the scrollbar only appears when a
+   line actually overflows. Height stays with the corner drag handle. */
+.modal textarea.pattern-input {
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  overflow-y: auto;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
 /* Keeps room for the chevron that the shared padding shorthand above
    would otherwise reset. */
 .modal select { padding-right: 24px; }
@@ -1083,6 +1101,9 @@ body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-sel
    box. The icon's own line box is shorter than the 11px/1.4 text line, so
    matching that line-height is what lines the two up; without it the glyph
    sits high and the note looks top-heavy. */
+/* Error messages quote the offending pattern, and a long unbroken regex
+   would otherwise push the note (and the modal) sideways. */
+.modal-note span { min-width: 0; overflow-wrap: anywhere; }
 .modal-note i {
   flex-shrink: 0;
   line-height: 1.4;

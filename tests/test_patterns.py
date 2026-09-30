@@ -12,8 +12,10 @@ from backend.patterns import (
     is_regex,
     matches_any,
     pattern_matches,
+    clean_field,
     split_patterns,
     validate,
+    validate_field,
 )
 
 
@@ -117,7 +119,9 @@ def test_semicolon_inside_a_regex_is_not_a_separator():
 
 
 def test_newline_inside_a_regex_is_not_a_separator():
-    assert split_patterns("'a\nb'") == ["'a\nb'"]
+    """Not a separator, and not kept either: it's a wrapped paste, so it's
+    removed and the regex is joined back together."""
+    assert split_patterns("'a\nb'") == ["'ab'"]
 
 
 def test_braces_in_regex_survive_splitting():
@@ -219,3 +223,83 @@ def test_nested_quantifiers_never_match_at_runtime(evil):
 def test_ordinary_regexes_are_not_false_positives(good):
     """The guard must not reject the patterns people actually write."""
     assert validate(good) is None
+
+
+
+# ── pasted patterns: cleanup and save-time rejection ──────────────────────────
+#
+# Long regexes get pasted from chat, docs and terminals, and the paste brings
+# damage with it. Every case below used to save without an error and then
+# silently never match.
+
+LONG = r"^(prod|api|clp|cli)\.(eu|na|latam|sa)\.(one|two|three|four)\.someurl\.(eu|com)$"
+HOSTS_IN = ["prod.eu.one.someurl.com", "cli.latam.four.someurl.eu", "API.NA.TWO.SOMEURL.COM"]
+HOSTS_OUT = ["x.eu.one.someurl.com", "api.eu.one.someurl.org", "api.eu.one.someurl.com.evil.io"]
+
+
+@pytest.mark.parametrize("raw", [
+    f"'{LONG}'",
+    "'" + LONG[:40] + "\n" + LONG[40:] + "'",              # wrapped with a line break
+    "'" + LONG[:40] + "\r\n" + LONG[40:] + "'",            # ...Windows line ending
+    "'" + LONG[:40] + " " + LONG[40:] + "'",               # wrapped with a space
+    "'" + LONG[:20] + "\n  " + LONG[20:60] + "\t" + LONG[60:] + "'",  # several wraps
+    f"‘{LONG}’",                                  # curly quotes
+    f"'{LONG[:30]}​{LONG[30:]}'",                      # zero-width space
+    f"﻿'{LONG}'",                                      # BOM at the start
+])
+def test_long_pasted_regex_is_repaired_and_matches(raw):
+    assert validate_field(raw) is None
+    assert split_patterns(raw) == [f"'{LONG}'"]
+    for h in HOSTS_IN:
+        assert matches_any(raw, h), h
+    for h in HOSTS_OUT:
+        assert not matches_any(raw, h), h
+
+
+def test_whitespace_outside_quotes_separates_patterns():
+    assert split_patterns("*.a.com *.b.com\t'^c\\.com$'") == ["*.a.com", "*.b.com", r"'^c\.com$'"]
+
+
+def test_several_long_regexes_one_per_line():
+    other = LONG.replace("someurl", "otherurl")
+    raw = f"'{LONG}'\n'{other}'\n*.plain.com"
+    assert validate_field(raw) is None
+    assert matches_any(raw, "api.eu.one.otherurl.com")
+    assert matches_any(raw, "x.plain.com")
+
+
+def test_semicolon_and_character_classes_survive_cleanup():
+    raw = r"'^[a-z;]+\.com$'; '^cdn\d{1,3}\.x\.com$'"
+    assert validate_field(raw) is None
+    assert matches_any(raw, "ab;c.com")
+    assert matches_any(raw, "cdn42.x.com")
+
+
+@pytest.mark.parametrize("raw, needle", [
+    (LONG, "quotes"),                                   # regex with no quotes
+    (f"'{LONG}\n*.google.com", "unclosed quote"),       # missing closing quote
+    (f"*.google.com\n{LONG}", "pattern 2"),            # says which one is wrong
+    ("https://example.com/path", "url"),
+    ("foo'bar'", "stray quote"),
+    ("''", "empty regex"),
+    ("  ;\n ", "empty"),
+])
+def test_unrepairable_fields_are_rejected_with_a_reason(raw, needle):
+    err = validate_field(raw)
+    assert err is not None
+    assert needle in err.lower()
+
+
+@pytest.mark.parametrize("glob", ["*.google.com", "google.com", "cdn?.x.com",
+                                  "[ab].x.com", "*", "10.0.0.*", "2001:db8::1"])
+def test_ordinary_globs_are_still_accepted(glob):
+    assert validate_field(glob) is None
+
+
+def test_clean_field_is_the_canonical_stored_form():
+    raw = "‘" + LONG[:40] + "\n" + LONG[40:] + "’ ; *.a.com;;"
+    cleaned = clean_field(raw)
+    assert cleaned == f"'{LONG}'\n*.a.com"
+    # Cleaning is stable, so re-saving a rule never changes it again.
+    assert clean_field(cleaned) == cleaned
+    assert validate_field(cleaned) is None

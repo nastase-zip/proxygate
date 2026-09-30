@@ -1,13 +1,13 @@
 /**
  * flow-detail.js — Charles/Burp-style request/response detail viewer.
  *
- * Opens on clicking a traffic row whose protocol is HTTP or HTTPS (the only
- * protocols that can ever have captured detail — see mitm_logger.py: only
- * decrypted flows reach the request()/response() hooks that populate
- * flow_details). Fetches /api/traffic/<id>/detail and renders headers +
- * body for both directions; a 404 (not decrypted, or a race where the flow
- * hasn't completed logging yet) shows a plain empty-state message instead
- * of an error.
+ * Opens on clicking any traffic row. Only HTTP and decrypted HTTPS can ever
+ * have captured detail (see mitm_logger.py: only flows that reach the
+ * request()/response() hooks populate flow_details), so those fetch
+ * /api/traffic/<id>/detail and render headers + body for both directions.
+ * Every other protocol, and an HTTP/S flow with no detail row (a 404: e.g.
+ * the response() hook hadn't fired yet), shows the same pane with the host
+ * in the title and a note saying why there's nothing more to show.
  */
 
 (function () {
@@ -244,7 +244,33 @@
       .forEach((tr) => tr.classList.remove("row-selected"));
   }
 
+  // Why a connection has no headers/body to show, by protocol.
+  const EMPTY_REASONS = {
+    TLS: "Raw TLS passthrough: routed by its SNI without being decrypted, so there " +
+         "are no headers or body to show. Enable decryption for this device in " +
+         "Devices to capture them.",
+    TCP: "Plain TCP connection (not HTTP), so there are no headers or body to show.",
+    "QUIC (blocked)": "QUIC (HTTP/3 over UDP) was blocked so the device falls back " +
+                      "to TCP. Nothing was transferred on this connection.",
+  };
+  const EMPTY_DEFAULT = "No request/response detail was captured for this connection.";
+
+  function showEmpty(protocol) {
+    const el = document.getElementById("fd-empty");
+    el.textContent = EMPTY_REASONS[protocol] || EMPTY_DEFAULT;
+    el.classList.remove("hidden");
+  }
+
+  // Only these protocols can ever have a flow_details row, so anything else
+  // skips the fetch that would always 404.
+  const DETAIL_CAPABLE_PROTOCOLS = new Set(["HTTP", "HTTPS"]);
+
+  // Bumped on every open(), so a slow detail fetch for a row the user has
+  // already clicked away from can't overwrite the row now being shown.
+  let openSeq = 0;
+
   async function open(connectionId, row) {
+    const seq = ++openSeq;
     const host = row.dest_host || "?";
     const title = document.getElementById("fd-title");
     title.textContent = `${host}:${row.dest_port || "?"}`;
@@ -276,8 +302,14 @@
     // After the pane is visible, so the title has real layout to measure.
     updateCopyVisibility();
 
+    if (!DETAIL_CAPABLE_PROTOCOLS.has(row.protocol)) {
+      showEmpty(row.protocol);
+      return;
+    }
+
     try {
       const res = await PG.api.get(`/api/traffic/${connectionId}/detail`);
+      if (seq !== openSeq) return;
       setSection("request", res.request_headers, res.request_body_b64, res.request_truncated);
       const respPairs = setSection("response", res.response_headers, res.response_body_b64, res.response_truncated);
       renderChips(row, respPairs);
@@ -285,10 +317,11 @@
       document.getElementById("fd-body").classList.remove("hidden");
       PG.log.info(TAG, "Flow detail loaded", { connectionId });
     } catch (e) {
+      if (seq !== openSeq) return;
       // 404 is the normal/expected case for anything not captured — not
       // every "clickable" row necessarily has a row in flow_details (e.g.
       // the response() hook hadn't fired yet when this was fetched).
-      document.getElementById("fd-empty").classList.remove("hidden");
+      showEmpty(row.protocol);
       PG.log.info(TAG, "No flow detail available", { connectionId, error: e.message });
     }
   }

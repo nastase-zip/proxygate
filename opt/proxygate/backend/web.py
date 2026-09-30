@@ -333,13 +333,15 @@ def add_rule():
     enabled = bool(body.get("enabled", True))
     if not name or not pattern:
         return _err("Name and pattern are required.")
-    # Reject a malformed regex now, while the user is still looking at the
+    # Reject a malformed pattern now, while the user is still looking at the
     # dialog — an invalid pattern otherwise saves fine and then silently
     # never matches anything, which is near-impossible to debug later.
-    for _p in patterns_mod.split_patterns(pattern):
-        _bad = patterns_mod.validate(_p)
-        if _bad:
-            return _err(_bad)
+    _bad = patterns_mod.validate_field(pattern)
+    if _bad:
+        return _err(_bad)
+    # Store the cleaned form (paste damage repaired, one pattern per line) so
+    # rules.yaml and the edit dialog show exactly what gets matched.
+    pattern = patterns_mod.clean_field(pattern)
     with rules_mod.rules_transaction():
         data = rules_mod.load_rules()
         data = rules_mod.add_rule(data, name, pattern, proxy, enabled)
@@ -357,13 +359,15 @@ def update_rule(index: int):
     enabled = bool(body.get("enabled", True))
     if not name or not pattern:
         return _err("Name and pattern are required.")
-    # Reject a malformed regex now, while the user is still looking at the
+    # Reject a malformed pattern now, while the user is still looking at the
     # dialog — an invalid pattern otherwise saves fine and then silently
     # never matches anything, which is near-impossible to debug later.
-    for _p in patterns_mod.split_patterns(pattern):
-        _bad = patterns_mod.validate(_p)
-        if _bad:
-            return _err(_bad)
+    _bad = patterns_mod.validate_field(pattern)
+    if _bad:
+        return _err(_bad)
+    # Store the cleaned form (paste damage repaired, one pattern per line) so
+    # rules.yaml and the edit dialog show exactly what gets matched.
+    pattern = patterns_mod.clean_field(pattern)
     with rules_mod.rules_transaction():
         data = rules_mod.load_rules()
         data = rules_mod.update_rule(data, index, name, pattern, proxy, enabled)

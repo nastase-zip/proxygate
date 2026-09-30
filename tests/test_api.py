@@ -91,6 +91,24 @@ def test_add_rule_rejects_a_broken_regex(client, pattern):
     assert "regex" in body(r)["msg"].lower()
 
 
+def test_a_pasted_long_regex_is_saved_clean(client):
+    """The paste damage is repaired before saving, so rules.yaml and the edit
+    dialog show exactly the regex that gets matched."""
+    long = r"^(prod|api|clp|cli)\.(eu|na|latam|sa)\.(one|two|three|four)\.someurl\.(eu|com)$"
+    pasted = "‘" + long[:40] + "\n" + long[40:] + "’;*.a.com"
+    r = client.post("/api/rules", json={"name": "Long", "pattern": pasted, "proxy": "XVPN"})
+    assert r.status_code == 200
+    rule = next(x for x in body(client.get("/api/rules"))["data"]["rules"] if x["name"] == "Long")
+    assert rule["pattern"] == f"'{long}'\n*.a.com"
+
+
+def test_an_unquoted_regex_is_rejected(client):
+    r = client.post("/api/rules", json={"name": "NoQuotes",
+                                        "pattern": r"^api\.x\.com$", "proxy": "XVPN"})
+    assert r.status_code == 400
+    assert "quotes" in body(r)["msg"].lower()
+
+
 def test_update_rule_also_validates_the_regex(client):
     r = client.put("/api/rules/0", json={"name": "X", "pattern": "'[bad'",
                                          "proxy": "XVPN"})

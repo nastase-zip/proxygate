@@ -90,13 +90,6 @@
     return "row-other";
   }
 
-  // Only these protocols ever have a flow_details row to show (see
-  // mitm_logger.py: only the request()/response() hooks — which fire for
-  // plain HTTP and decrypted HTTPS, never raw-TLS passthrough — insert into
-  // flow_details). Clicking any other row would always hit an empty state,
-  // so skip the click affordance entirely for them.
-  const DETAIL_CAPABLE_PROTOCOLS = new Set(["HTTP", "HTTPS"]);
-
   function buildRowEl(row) {
     const tr = document.createElement("tr");
     const proxy = row.proxy_used || "DIRECT";
@@ -105,11 +98,13 @@
 
     const protocol = row.protocol || "—";
     tr.dataset.protocol = protocol;
-    if (DETAIL_CAPABLE_PROTOCOLS.has(protocol)) {
-      tr.classList.add("row-clickable");
-      tr.title = "Click to view request/response detail";
-      tr.addEventListener("click", () => window.PG.flowDetail.open(row.id, row));
-    }
+    // Every row opens the detail pane, even ones with no captured
+    // headers/body (raw TLS, TCP, blocked QUIC): the pane's title shows the
+    // full host with a copy button, which the table cell often truncates.
+    // flow-detail.js explains per protocol why there's nothing more to show.
+    tr.classList.add("row-clickable");
+    tr.title = "Click to inspect this connection";
+    tr.addEventListener("click", () => window.PG.flowDetail.open(row.id, row));
 
     const cells = [
       fmtTime(row.timestamp),
