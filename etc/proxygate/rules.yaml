@@ -24,5 +24,13 @@ rules:
 - enabled: true
   id: 445e9ab8-c2af-45ec-ae10-a86f2354df63
   name: IP Info
-  pattern: '*.ipinfo.io'
-  proxy: XVPN
+  pattern: '''^(api|mon|log|gecko|aggr)\d{2}-normal(-[a-z]{2}\d[a-z])?\.tiktokv\.(eu|com|us)$''
+
+    ''^(v\d{1,3}m?|p\d{1,3}-(common-sign|sign|va))\.tiktokcdn(-(eu|us|ttp))?\.com$''
+
+    ''^((api|gsp|gspe)-glb-[a-z]{4}\d[a-z]\.smoot|cdsassets|(gs|gsp)\d{1,3}-[a-z]{2,6})\.apple\.com$''
+
+    ''^[a-z0-9]{4,12}\.(launches|inapps|conversions|attr|gcdsdk)\.appsflyersdk\.com$''
+
+    ''^(?!.*\.(evil|test)\.)(?:(?:api|mon|log|gecko|aggr)\d{2}-normal(?:-[a-z]{2}\d[a-z])?\.tiktokv|(?:v\d{1,3}m?|p\d{1,3}-common-sign)\.tiktokcdn-eu|[a-z0-9]{6}\.launches\.appsflyersdk|(?:api-glb-[a-z]{4}\d[a-z]\.smoot|cdsassets)\.apple)\.(?:eu|com)$'''
+  proxy: DIRECT

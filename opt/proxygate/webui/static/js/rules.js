@@ -268,9 +268,37 @@
     }
   }
 
+  // Height of the Patterns textarea, dragged from its corner. Per-browser
+  // display preference, like the traffic pane and column sizes. Shared by the
+  // Add and Edit dialogs, which hold the same field.
+  const PATTERN_H_KEY = "proxygate_rule_pattern_h";
+  const PATTERN_MIN_H = 40;
+
+  function restorePatternHeight(ta) {
+    try {
+      const saved = parseFloat(localStorage.getItem(PATTERN_H_KEY));
+      if (saved >= PATTERN_MIN_H) ta.style.height = saved + "px";
+    } catch (e) { /* private mode — default height stays */ }
+  }
+
+  // A textarea's native resize fires no event of its own, so watch its size.
+  // Only a visible field is saved: a hidden modal measures 0 and would
+  // otherwise overwrite the stored height.
+  function watchPatternHeight(ta) {
+    if (typeof ResizeObserver === "undefined") return;
+    new ResizeObserver(() => {
+      if (!ta.offsetParent) return;
+      const h = ta.getBoundingClientRect().height;
+      if (h < PATTERN_MIN_H) return;
+      try { localStorage.setItem(PATTERN_H_KEY, String(Math.round(h))); }
+      catch (e) { /* private mode — applies for this session only */ }
+    }).observe(ta);
+  }
+
   function openAddModal() {
     document.getElementById("af-name").value = "";
     document.getElementById("af-pattern").value = "";
+    restorePatternHeight(document.getElementById("af-pattern"));
     document.getElementById("af-enabled").checked = true;
     fillSelect(document.getElementById("af-proxy"), proxyDisplayItems(), "DIRECT");
     clearPatternError("af");
@@ -286,6 +314,7 @@
     if (!rule) return;
     document.getElementById("ef-name").value = rule.name || "";
     document.getElementById("ef-pattern").value = rule.pattern || "";
+    restorePatternHeight(document.getElementById("ef-pattern"));
     document.getElementById("ef-enabled").checked = rule.enabled !== false;
     fillSelect(document.getElementById("ef-proxy"), proxyDisplayItems(), rule.proxy || "DIRECT");
     clearPatternError("ef");
@@ -461,6 +490,8 @@
 
   function init() {
     document.getElementById("rule-add-btn").addEventListener("click", openAddModal);
+    watchPatternHeight(document.getElementById("af-pattern"));
+    watchPatternHeight(document.getElementById("ef-pattern"));
     const fallbackSelEl = document.getElementById("fallback-select");
     fallbackSelEl.addEventListener("change", (e) => { onFallbackChange(e); fallbackSelEl.blur(); });
     document.getElementById("apply-rules-btn").addEventListener("click", applyNow);
