@@ -9,5 +9,6 @@ __pycache__/
 etc/proxygate/devices.yaml
 etc/proxygate/blocked_devices.yaml
 etc/proxygate/config.yaml
+etc/proxygate/rules.yaml
 var/lib/proxygate/
 var/log/proxygate/
