@@ -108,7 +108,7 @@ _DEFAULT_RULES: dict = {
         {"name": "IP Info", "pattern": "*.ipinfo.io", "proxy": "XVPN", "enabled": True},
         {"name": "Google",  "pattern": "google.com",  "proxy": "XVPN", "enabled": True},
     ],
-    "default": "XVPN",
+    "default": "DIRECT",
 }
 
 # ── Routing helpers ───────────────────────────────────────────────────────────
